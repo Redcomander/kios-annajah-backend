@@ -1,0 +1,50 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Output of go build
+/bin/
+/build/
+/dist/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Dependency directories (optional, if you vendor)
+/vendor/
+
+# Go modules
+go.sum
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.*
+
+# Coverage files
+coverage.out
+
+# Temporary files
+*.tmp
+*.temp
+
+# Debug
+__debug_bin
+
+# Test binary
+*.out
