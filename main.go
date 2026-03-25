@@ -58,12 +58,12 @@ type ProductBatch struct {
 
 type Category struct {
 	ID   uint   `gorm:"primaryKey" json:"id"`
-	Name string `json:"name"`
+	Name string `gorm:"uniqueIndex" json:"name"`
 }
 
 type Unit struct {
 	ID   uint   `gorm:"primaryKey" json:"id"`
-	Name string `json:"name"`
+	Name string `gorm:"uniqueIndex" json:"name"`
 }
 
 type TransactionItem struct {
@@ -299,6 +299,27 @@ func initAdmin() error {
 	return nil
 }
 
+func ensureDefaultMasterData() error {
+	defaultCategories := []string{"Makanan", "Minuman", "Snack", "Rokok", "Sabun", "Bumbu", "Beras", "ATK", "Lainnya"}
+	defaultUnits := []string{"Pcs", "Pack", "Box", "Kg", "Gram", "Liter", "Ml", "Dus", "Botol", "Sachet"}
+
+	for _, name := range defaultCategories {
+		category := Category{Name: name}
+		if err := DB.Where("name = ?", name).FirstOrCreate(&category).Error; err != nil {
+			return fmt.Errorf("ensure default category %s: %w", name, err)
+		}
+	}
+
+	for _, name := range defaultUnits {
+		unit := Unit{Name: name}
+		if err := DB.Where("name = ?", name).FirstOrCreate(&unit).Error; err != nil {
+			return fmt.Errorf("ensure default unit %s: %w", name, err)
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found. Falling back to OS environment variables.")
@@ -313,6 +334,10 @@ func main() {
 
 	if err := initAdmin(); err != nil {
 		log.Fatalf("Failed to initialize admin user: %v", err)
+	}
+
+	if err := ensureDefaultMasterData(); err != nil {
+		log.Fatalf("Failed to initialize default categories and units: %v", err)
 	}
 
 	if err := ensureDir(uploadsDir); err != nil {
