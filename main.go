@@ -31,11 +31,11 @@ type User struct {
 
 type Product struct {
 	ID             uint       `gorm:"primaryKey" json:"id"`
-	Barcode        string     `gorm:"uniqueIndex" json:"barcode"`
+	Barcode        string     `gorm:"index" json:"barcode"`
 	Name           string     `json:"name"`
 	Price          float64    `json:"price"`
 	CostPrice      float64    `json:"cost_price"`
-	Stock          int        `json:"stock"`
+	Stock          float64    `json:"stock"`
 	Category       string     `json:"category"`
 	Unit           string     `json:"unit"`
 	Image          string     `json:"image"`
@@ -49,8 +49,8 @@ type Product struct {
 type ProductBatch struct {
 	ID           uint       `gorm:"primaryKey" json:"id"`
 	ProductID    uint       `gorm:"index" json:"product_id"`
-	Qty          int        `json:"qty"`
-	RemainingQty int        `json:"remaining_qty"`
+	Qty          float64    `json:"qty"`
+	RemainingQty float64    `json:"remaining_qty"`
 	ExpiredAt    *time.Time `json:"expired_at,omitempty"`
 	CreatedAt    time.Time  `json:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at"`
@@ -71,7 +71,7 @@ type TransactionItem struct {
 	TransactionID uint    `json:"transaction_id"`
 	ProductID     uint    `json:"product_id"`
 	ProductName   string  `json:"product_name"`
-	Qty           int     `json:"qty"`
+	Qty           float64 `json:"qty"`
 	Price         float64 `json:"price"`
 	CostPrice     float64 `json:"cost_price"`
 }
@@ -178,6 +178,10 @@ func ConnectDB() error {
 	if err := DB.AutoMigrate(&Product{}, &ProductBatch{}, &Transaction{}, &TransactionItem{}, &Category{}, &Unit{}, &User{}, &ActivityLog{}); err != nil {
 		return fmt.Errorf("auto migrate schema: %w", err)
 	}
+
+	// Barcode is optional, so old unique index must be removed to allow empty/duplicate blanks.
+	_ = DB.Exec("DROP INDEX IF EXISTS idx_products_barcode").Error
+	_ = DB.Migrator().CreateIndex(&Product{}, "Barcode")
 
 	return nil
 }
@@ -629,9 +633,14 @@ func main() {
 		}
 
 		// Update fields
-		if v := c.FormValue("barcode"); v != "" {
-			product.Barcode = v
+		barcode := strings.TrimSpace(c.FormValue("barcode"))
+		if barcode != "" {
+			var count int64
+			if err := DB.Model(&Product{}).Where("barcode = ? AND id <> ?", barcode, product.ID).Count(&count).Error; err == nil && count > 0 {
+				return c.Status(409).JSON(fiber.Map{"error": "Barcode already exists"})
+			}
 		}
+		product.Barcode = barcode
 		if v := c.FormValue("name"); v != "" {
 			product.Name = v
 		}
@@ -652,7 +661,7 @@ func main() {
 			}
 		}
 		if v := c.FormValue("stock"); v != "" {
-			if s, err := strconv.Atoi(v); err == nil {
+			if s, err := strconv.ParseFloat(v, 64); err == nil {
 				product.Stock = s
 			}
 		}
@@ -667,7 +676,7 @@ func main() {
 		}
 
 		DB.Save(&product)
-		logActivity(c, "edit_produk", product.Name, fmt.Sprintf("harga: %.0f, stok: %d", product.Price, product.Stock))
+		logActivity(c, "edit_produk", product.Name, fmt.Sprintf("harga: %.0f, stok: %.3f", product.Price, product.Stock))
 		return c.JSON(product)
 	})
 
@@ -687,10 +696,17 @@ func main() {
 	app.Post("/api/products", Protected(), func(c *fiber.Ctx) error {
 
 		product := new(Product)
-		product.Barcode = c.FormValue("barcode")
+		product.Barcode = strings.TrimSpace(c.FormValue("barcode"))
 		product.Name = c.FormValue("name")
 		product.Category = c.FormValue("category")
 		product.Unit = c.FormValue("unit")
+
+		if product.Barcode != "" {
+			var count int64
+			if err := DB.Model(&Product{}).Where("barcode = ?", product.Barcode).Count(&count).Error; err == nil && count > 0 {
+				return c.Status(409).JSON(fiber.Map{"error": "Barcode already exists"})
+			}
+		}
 
 		if p, err := strconv.ParseFloat(c.FormValue("price"), 64); err == nil {
 			product.Price = p
@@ -698,7 +714,7 @@ func main() {
 		if cp, err := strconv.ParseFloat(c.FormValue("cost_price"), 64); err == nil {
 			product.CostPrice = cp
 		}
-		if s, err := strconv.Atoi(c.FormValue("stock")); err == nil {
+		if s, err := strconv.ParseFloat(c.FormValue("stock"), 64); err == nil {
 			product.Stock = s
 		}
 
@@ -732,15 +748,15 @@ func main() {
 				}
 			}
 		}
-		logActivity(c, "tambah_produk", product.Name, fmt.Sprintf("harga: %.0f, stok: %d", product.Price, product.Stock))
+		logActivity(c, "tambah_produk", product.Name, fmt.Sprintf("harga: %.0f, stok: %.3f", product.Price, product.Stock))
 		return c.JSON(product)
 	})
 
 	app.Post("/api/products/:id/restock", Protected(), func(c *fiber.Ctx) error {
 
 		type RestockRequest struct {
-			Qty       int    `json:"qty"`
-			ExpiredAt string `json:"expired_at"`
+			Qty       float64 `json:"qty"`
+			ExpiredAt string  `json:"expired_at"`
 		}
 
 		id := c.Params("id")
@@ -781,7 +797,7 @@ func main() {
 		}
 
 		tx.Commit()
-		logActivity(c, "tambah_stok", product.Name, fmt.Sprintf("+%d unit", req.Qty))
+		logActivity(c, "tambah_stok", product.Name, fmt.Sprintf("+%.3f unit", req.Qty))
 		return c.JSON(fiber.Map{"message": "Stock updated", "batch": batch})
 	})
 
@@ -1201,7 +1217,7 @@ func main() {
 
 		type bestSellingProduct struct {
 			Name    string  `json:"name"`
-			QtySold int     `json:"qty_sold"`
+			QtySold float64 `json:"qty_sold"`
 			Revenue float64 `json:"revenue"`
 		}
 
