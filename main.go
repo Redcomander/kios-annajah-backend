@@ -101,7 +101,7 @@ type DigitalTransaction struct {
 	SellPrice       float64   `json:"sell_price"`
 	Profit          float64   `json:"profit"`
 	Status          string    `gorm:"index" json:"status"` // pending, success, failed
-	Source          string    `json:"source"` // manual, assisted
+	Source          string    `json:"source"`              // manual, assisted
 	MitraRef        string    `json:"mitra_ref"`
 	Notes           string    `json:"notes"`
 	CreatedByID     uint      `json:"created_by_id"`
