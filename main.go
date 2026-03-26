@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/csv"
 	"fmt"
 	"log"
 	"os"
@@ -67,13 +69,16 @@ type Unit struct {
 }
 
 type TransactionItem struct {
-	ID            uint    `gorm:"primaryKey" json:"id"`
-	TransactionID uint    `json:"transaction_id"`
-	ProductID     uint    `json:"product_id"`
-	ProductName   string  `json:"product_name"`
-	Qty           float64 `json:"qty"`
-	Price         float64 `json:"price"`
-	CostPrice     float64 `json:"cost_price"`
+	ID            uint       `gorm:"primaryKey" json:"id"`
+	TransactionID uint       `json:"transaction_id"`
+	ProductID     uint       `json:"product_id"`
+	ProductName   string     `json:"product_name"`
+	Qty           float64    `json:"qty"`
+	Price         float64    `json:"price"`
+	CostPrice     float64    `json:"cost_price"`
+	IsVoided      bool       `gorm:"default:false" json:"is_voided"`
+	VoidedAt      *time.Time `json:"voided_at,omitempty"`
+	VoidReason    string     `json:"void_reason,omitempty"`
 }
 
 type Transaction struct {
@@ -85,6 +90,25 @@ type Transaction struct {
 	VoidedAt      *time.Time        `json:"voided_at,omitempty"`
 	VoidReason    string            `json:"void_reason,omitempty"`
 	Items         []TransactionItem `json:"items" gorm:"foreignKey:TransactionID"`
+}
+
+type DigitalTransaction struct {
+	ID              uint      `gorm:"primaryKey" json:"id"`
+	TransactionType string    `json:"transaction_type"` // pulsa, paket_data
+	Provider        string    `json:"provider"`
+	CustomerNumber  string    `json:"customer_number"`
+	ProductName     string    `json:"product_name"`
+	BuyPrice        float64   `json:"buy_price"`
+	SellPrice       float64   `json:"sell_price"`
+	Profit          float64   `json:"profit"`
+	Status          string    `json:"status"` // pending, success, failed
+	Source          string    `json:"source"` // manual, assisted
+	MitraRef        string    `json:"mitra_ref"`
+	Notes           string    `json:"notes"`
+	CreatedByID     uint      `json:"created_by_id"`
+	CreatedBy       string    `json:"created_by"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 type ActivityLog struct {
@@ -175,7 +199,7 @@ func ConnectDB() error {
 
 	log.Println("Connected to Database!")
 
-	if err := DB.AutoMigrate(&Product{}, &ProductBatch{}, &Transaction{}, &TransactionItem{}, &Category{}, &Unit{}, &User{}, &ActivityLog{}); err != nil {
+	if err := DB.AutoMigrate(&Product{}, &ProductBatch{}, &Transaction{}, &TransactionItem{}, &DigitalTransaction{}, &Category{}, &Unit{}, &User{}, &ActivityLog{}); err != nil {
 		return fmt.Errorf("auto migrate schema: %w", err)
 	}
 
@@ -198,6 +222,92 @@ func parseOptionalDate(value string) (*time.Time, error) {
 	}
 
 	return &t, nil
+}
+
+func formatCSVNumber(value float64) string {
+	return strconv.FormatFloat(value, 'f', -1, 64)
+}
+
+func buildCSVContent(headers []string, rows [][]string) ([]byte, error) {
+	var buffer bytes.Buffer
+	writer := csv.NewWriter(&buffer)
+
+	if err := writer.Write(headers); err != nil {
+		return nil, err
+	}
+
+	if err := writer.WriteAll(rows); err != nil {
+		return nil, err
+	}
+
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return nil, err
+	}
+
+	return buffer.Bytes(), nil
+}
+
+func sendCSV(c *fiber.Ctx, filename string, headers []string, rows [][]string) error {
+	content, err := buildCSVContent(headers, rows)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to generate CSV"})
+	}
+
+	c.Set("Content-Type", "text/csv; charset=utf-8")
+	c.Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	return c.Send(content)
+}
+
+func restoreTransactionItemStock(tx *gorm.DB, item TransactionItem) error {
+	if err := tx.Model(&Product{}).Where("id = ?", item.ProductID).Update("stock", gorm.Expr("stock + ?", item.Qty)).Error; err != nil {
+		return err
+	}
+
+	reversalBatch := ProductBatch{
+		ProductID:    item.ProductID,
+		Qty:          item.Qty,
+		RemainingQty: item.Qty,
+	}
+
+	return tx.Create(&reversalBatch).Error
+}
+
+func syncTransactionVoidState(tx *gorm.DB, transactionID uint, fallbackReason string) error {
+	var items []TransactionItem
+	if err := tx.Where("transaction_id = ?", transactionID).Find(&items).Error; err != nil {
+		return err
+	}
+
+	activeTotal := 0.0
+	allVoided := len(items) > 0
+	for _, item := range items {
+		if item.IsVoided {
+			continue
+		}
+
+		allVoided = false
+		activeTotal += item.Price * item.Qty
+	}
+
+	updates := map[string]interface{}{
+		"total_amount": activeTotal,
+	}
+
+	if allVoided {
+		now := time.Now()
+		updates["is_voided"] = true
+		updates["voided_at"] = &now
+		if strings.TrimSpace(fallbackReason) != "" {
+			updates["void_reason"] = strings.TrimSpace(fallbackReason)
+		}
+	} else {
+		updates["is_voided"] = false
+		updates["voided_at"] = nil
+		updates["void_reason"] = ""
+	}
+
+	return tx.Model(&Transaction{}).Where("id = ?", transactionID).Updates(updates).Error
 }
 
 func enrichProductsWithAlerts(products []Product) []Product {
@@ -890,16 +1000,117 @@ func main() {
 		}
 
 		tx.Commit()
+		logActivity(c, "checkout", fmt.Sprintf("%d item", len(req.Items)), fmt.Sprintf("total: %.0f, metode: %s", req.Total, req.PaymentMethod))
 		return c.JSON(fiber.Map{"message": "Transaction success", "id": transaction.ID})
 	})
 
 	// GET Transactions History - Protected
 	app.Get("/api/transactions", Protected(), func(c *fiber.Ctx) error {
+		dateFrom := strings.TrimSpace(c.Query("date_from"))
+		dateTo := strings.TrimSpace(c.Query("date_to"))
+		includeVoided := strings.EqualFold(strings.TrimSpace(c.Query("include_voided", "true")), "true")
+		limit, _ := strconv.Atoi(c.Query("limit", "50"))
+		if limit < 1 || limit > 1000 {
+			limit = 50
+		}
+
+		if dateFrom != "" {
+			if _, err := time.Parse("2006-01-02", dateFrom); err != nil {
+				return c.Status(400).JSON(fiber.Map{"error": "Invalid date_from"})
+			}
+		}
+		if dateTo != "" {
+			if _, err := time.Parse("2006-01-02", dateTo); err != nil {
+				return c.Status(400).JSON(fiber.Map{"error": "Invalid date_to"})
+			}
+		}
+
+		query := DB.Preload("Items").Order("created_at desc")
+		if dateFrom != "" {
+			query = query.Where("DATE(created_at) >= ?", dateFrom)
+		}
+		if dateTo != "" {
+			query = query.Where("DATE(created_at) <= ?", dateTo)
+		}
+		if !includeVoided {
+			query = query.Where("is_voided = ?", false)
+		}
+
 		var transactions []Transaction
-		if err := DB.Preload("Items").Order("created_at desc").Limit(50).Find(&transactions).Error; err != nil {
+		if err := query.Limit(limit).Find(&transactions).Error; err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to fetch transactions"})
 		}
 		return c.JSON(transactions)
+	})
+
+	app.Get("/api/exports/transactions.csv", Protected(), func(c *fiber.Ctx) error {
+		dateFrom := strings.TrimSpace(c.Query("date_from"))
+		dateTo := strings.TrimSpace(c.Query("date_to"))
+		includeVoided := strings.EqualFold(strings.TrimSpace(c.Query("include_voided", "true")), "true")
+
+		if dateFrom != "" {
+			if _, err := time.Parse("2006-01-02", dateFrom); err != nil {
+				return c.Status(400).JSON(fiber.Map{"error": "Invalid date_from"})
+			}
+		}
+		if dateTo != "" {
+			if _, err := time.Parse("2006-01-02", dateTo); err != nil {
+				return c.Status(400).JSON(fiber.Map{"error": "Invalid date_to"})
+			}
+		}
+
+		query := DB.Preload("Items").Model(&Transaction{}).Order("created_at desc")
+		if dateFrom != "" {
+			query = query.Where("DATE(created_at) >= ?", dateFrom)
+		}
+		if dateTo != "" {
+			query = query.Where("DATE(created_at) <= ?", dateTo)
+		}
+		if !includeVoided {
+			query = query.Where("is_voided = ?", false)
+		}
+
+		var transactions []Transaction
+		if err := query.Find(&transactions).Error; err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to fetch transactions"})
+		}
+
+		rows := make([][]string, 0, len(transactions))
+		for _, transaction := range transactions {
+			grossProfit := 0.0
+			itemSummaries := make([]string, 0, len(transaction.Items))
+			for _, item := range transaction.Items {
+				if !item.IsVoided {
+					grossProfit += (item.Price - item.CostPrice) * item.Qty
+				}
+
+				itemSummary := fmt.Sprintf("%s (qty %s x %s)", item.ProductName, formatCSVNumber(item.Qty), formatCSVNumber(item.Price))
+				if item.IsVoided {
+					itemSummary += " [VOID]"
+				}
+				itemSummaries = append(itemSummaries, itemSummary)
+			}
+
+			voidedAt := ""
+			if transaction.VoidedAt != nil {
+				voidedAt = transaction.VoidedAt.Format("2006-01-02 15:04:05")
+			}
+
+			rows = append(rows, []string{
+				strconv.FormatUint(uint64(transaction.ID), 10),
+				transaction.CreatedAt.Format("2006-01-02 15:04:05"),
+				transaction.PaymentMethod,
+				formatCSVNumber(transaction.TotalAmount),
+				formatCSVNumber(grossProfit),
+				strconv.FormatBool(transaction.IsVoided),
+				voidedAt,
+				transaction.VoidReason,
+				strings.Join(itemSummaries, " | "),
+			})
+		}
+
+		filename := fmt.Sprintf("transaksi_%s.csv", time.Now().Format("20060102_150405"))
+		return sendCSV(c, filename, []string{"id", "created_at", "payment_method", "total_amount", "gross_profit", "is_voided", "voided_at", "void_reason", "items"}, rows)
 	})
 
 	app.Delete("/api/transactions/:id", Protected(), func(c *fiber.Ctx) error {
@@ -925,40 +1136,39 @@ func main() {
 		_ = c.BodyParser(&req)
 
 		tx := DB.Begin()
-
-		for _, item := range transaction.Items {
-			if err := tx.Model(&Product{}).Where("id = ?", item.ProductID).Update("stock", gorm.Expr("stock + ?", item.Qty)).Error; err != nil {
-				tx.Rollback()
-				return c.Status(500).JSON(fiber.Map{"error": "Failed to restore stock"})
-			}
-
-			reversalBatch := ProductBatch{
-				ProductID:    item.ProductID,
-				Qty:          item.Qty,
-				RemainingQty: item.Qty,
-			}
-			if err := tx.Create(&reversalBatch).Error; err != nil {
-				tx.Rollback()
-				return c.Status(500).JSON(fiber.Map{"error": "Failed to restore stock batch"})
-			}
-		}
-
 		voidedAt := time.Now()
 		reason := strings.TrimSpace(req.Reason)
 		if reason == "" {
 			reason = "Void/refund by admin"
 		}
 
-		if err := tx.Model(&Transaction{}).Where("id = ?", transaction.ID).Updates(map[string]interface{}{
-			"is_voided":   true,
-			"voided_at":   voidedAt,
-			"void_reason": reason,
-		}).Error; err != nil {
+		for _, item := range transaction.Items {
+			if item.IsVoided {
+				continue
+			}
+
+			if err := restoreTransactionItemStock(tx, item); err != nil {
+				tx.Rollback()
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to restore stock batch"})
+			}
+
+			if err := tx.Model(&TransactionItem{}).Where("id = ?", item.ID).Updates(map[string]interface{}{
+				"is_voided":   true,
+				"voided_at":   &voidedAt,
+				"void_reason": reason,
+			}).Error; err != nil {
+				tx.Rollback()
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to mark item as voided"})
+			}
+		}
+
+		if err := syncTransactionVoidState(tx, transaction.ID, reason); err != nil {
 			tx.Rollback()
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to mark transaction as voided"})
 		}
 
 		tx.Commit()
+		logActivity(c, "void_transaksi", fmt.Sprintf("trx #%d", transaction.ID), reason)
 		return c.JSON(fiber.Map{"message": "Transaction voided and stock restored"})
 	})
 
@@ -987,41 +1197,319 @@ func main() {
 		}
 
 		tx := DB.Begin()
-
-		for _, item := range transaction.Items {
-			if err := tx.Model(&Product{}).Where("id = ?", item.ProductID).Update("stock", gorm.Expr("stock + ?", item.Qty)).Error; err != nil {
-				tx.Rollback()
-				return c.Status(500).JSON(fiber.Map{"error": "Failed to restore stock"})
-			}
-
-			reversalBatch := ProductBatch{
-				ProductID:    item.ProductID,
-				Qty:          item.Qty,
-				RemainingQty: item.Qty,
-			}
-			if err := tx.Create(&reversalBatch).Error; err != nil {
-				tx.Rollback()
-				return c.Status(500).JSON(fiber.Map{"error": "Failed to restore stock batch"})
-			}
-		}
-
+		voidedAt := time.Now()
 		reason := strings.TrimSpace(req.Reason)
 		if reason == "" {
 			reason = "Refund by admin"
 		}
-		voidedAt := time.Now()
 
-		if err := tx.Model(&Transaction{}).Where("id = ?", transaction.ID).Updates(map[string]interface{}{
-			"is_voided":   true,
-			"voided_at":   voidedAt,
-			"void_reason": reason,
-		}).Error; err != nil {
+		for _, item := range transaction.Items {
+			if item.IsVoided {
+				continue
+			}
+
+			if err := restoreTransactionItemStock(tx, item); err != nil {
+				tx.Rollback()
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to restore stock batch"})
+			}
+
+			if err := tx.Model(&TransactionItem{}).Where("id = ?", item.ID).Updates(map[string]interface{}{
+				"is_voided":   true,
+				"voided_at":   &voidedAt,
+				"void_reason": reason,
+			}).Error; err != nil {
+				tx.Rollback()
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to mark item as refunded"})
+			}
+		}
+
+		if err := syncTransactionVoidState(tx, transaction.ID, reason); err != nil {
 			tx.Rollback()
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to mark transaction as refunded"})
 		}
 
 		tx.Commit()
+		logActivity(c, "refund_transaksi", fmt.Sprintf("trx #%d", transaction.ID), reason)
 		return c.JSON(fiber.Map{"message": "Transaction refunded and stock restored"})
+	})
+
+	app.Post("/api/transactions/:id/items/:itemId/void", Protected(), func(c *fiber.Ctx) error {
+		if c.Locals("role") != "admin" {
+			return c.Status(403).JSON(fiber.Map{"error": "Admin required"})
+		}
+
+		transactionID := c.Params("id")
+		itemID := c.Params("itemId")
+
+		type itemVoidRequest struct {
+			Reason string `json:"reason"`
+		}
+
+		var req itemVoidRequest
+		_ = c.BodyParser(&req)
+
+		var transaction Transaction
+		if err := DB.Preload("Items").First(&transaction, transactionID).Error; err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "Transaction not found"})
+		}
+
+		var item TransactionItem
+		if err := DB.Where("id = ? AND transaction_id = ?", itemID, transaction.ID).First(&item).Error; err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "Transaction item not found"})
+		}
+
+		if item.IsVoided {
+			return c.Status(400).JSON(fiber.Map{"error": "Item already voided"})
+		}
+
+		reason := strings.TrimSpace(req.Reason)
+		if reason == "" {
+			reason = "Void item by admin"
+		}
+		voidedAt := time.Now()
+
+		tx := DB.Begin()
+		if err := restoreTransactionItemStock(tx, item); err != nil {
+			tx.Rollback()
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to restore stock"})
+		}
+
+		if err := tx.Model(&TransactionItem{}).Where("id = ?", item.ID).Updates(map[string]interface{}{
+			"is_voided":   true,
+			"voided_at":   &voidedAt,
+			"void_reason": reason,
+		}).Error; err != nil {
+			tx.Rollback()
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to mark item as voided"})
+		}
+
+		if err := syncTransactionVoidState(tx, transaction.ID, reason); err != nil {
+			tx.Rollback()
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to update transaction total"})
+		}
+
+		tx.Commit()
+
+		var updated Transaction
+		if err := DB.Preload("Items").First(&updated, transaction.ID).Error; err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to reload transaction"})
+		}
+
+		logActivity(c, "void_item_transaksi", fmt.Sprintf("trx #%d", updated.ID), fmt.Sprintf("%s | %s", item.ProductName, reason))
+		return c.JSON(updated)
+	})
+
+	app.Post("/api/digital-transactions", Protected(), func(c *fiber.Ctx) error {
+		type DigitalTransactionRequest struct {
+			TransactionType string  `json:"transaction_type"`
+			Provider        string  `json:"provider"`
+			CustomerNumber  string  `json:"customer_number"`
+			ProductName     string  `json:"product_name"`
+			BuyPrice        float64 `json:"buy_price"`
+			SellPrice       float64 `json:"sell_price"`
+			Status          string  `json:"status"`
+			Source          string  `json:"source"`
+			MitraRef        string  `json:"mitra_ref"`
+			Notes           string  `json:"notes"`
+		}
+
+		var req DigitalTransactionRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
+		}
+
+		typeValue := strings.ToLower(strings.TrimSpace(req.TransactionType))
+		if typeValue != "pulsa" && typeValue != "paket_data" {
+			return c.Status(400).JSON(fiber.Map{"error": "transaction_type must be pulsa or paket_data"})
+		}
+
+		customerNumber := strings.TrimSpace(req.CustomerNumber)
+		if customerNumber == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "customer_number is required"})
+		}
+
+		productName := strings.TrimSpace(req.ProductName)
+		if productName == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "product_name is required"})
+		}
+
+		status := strings.ToLower(strings.TrimSpace(req.Status))
+		if status == "" {
+			status = "pending"
+		}
+		if status != "pending" && status != "success" && status != "failed" {
+			return c.Status(400).JSON(fiber.Map{"error": "status must be pending, success, or failed"})
+		}
+
+		source := strings.ToLower(strings.TrimSpace(req.Source))
+		if source == "" {
+			source = "manual"
+		}
+		if source != "manual" && source != "assisted" {
+			return c.Status(400).JSON(fiber.Map{"error": "source must be manual or assisted"})
+		}
+
+		if req.BuyPrice < 0 || req.SellPrice < 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "price must be >= 0"})
+		}
+
+		username, _ := c.Locals("username").(string)
+		userIDFloat, _ := c.Locals("user_id").(float64)
+
+		record := DigitalTransaction{
+			TransactionType: typeValue,
+			Provider:        strings.TrimSpace(req.Provider),
+			CustomerNumber:  customerNumber,
+			ProductName:     productName,
+			BuyPrice:        req.BuyPrice,
+			SellPrice:       req.SellPrice,
+			Profit:          req.SellPrice - req.BuyPrice,
+			Status:          status,
+			Source:          source,
+			MitraRef:        strings.TrimSpace(req.MitraRef),
+			Notes:           strings.TrimSpace(req.Notes),
+			CreatedByID:     uint(userIDFloat),
+			CreatedBy:       username,
+		}
+
+		if err := DB.Create(&record).Error; err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to save digital transaction"})
+		}
+
+		logActivity(c, "catat_transaksi_digital", record.CustomerNumber, fmt.Sprintf("%s %s %.0f", record.TransactionType, record.ProductName, record.SellPrice))
+		return c.JSON(record)
+	})
+
+	app.Get("/api/digital-transactions", Protected(), func(c *fiber.Ctx) error {
+		limit, _ := strconv.Atoi(c.Query("limit", "300"))
+		if limit < 1 || limit > 1000 {
+			limit = 300
+		}
+
+		q := DB.Model(&DigitalTransaction{}).Order("created_at desc")
+
+		if dateFrom := strings.TrimSpace(c.Query("date_from")); dateFrom != "" {
+			q = q.Where("DATE(created_at) >= ?", dateFrom)
+		}
+		if dateTo := strings.TrimSpace(c.Query("date_to")); dateTo != "" {
+			q = q.Where("DATE(created_at) <= ?", dateTo)
+		}
+		if status := strings.TrimSpace(c.Query("status")); status != "" {
+			q = q.Where("status = ?", status)
+		}
+		if txType := strings.TrimSpace(c.Query("type")); txType != "" {
+			q = q.Where("transaction_type = ?", txType)
+		}
+		if provider := strings.TrimSpace(c.Query("provider")); provider != "" {
+			q = q.Where("provider LIKE ?", "%"+provider+"%")
+		}
+
+		var rows []DigitalTransaction
+		if err := q.Limit(limit).Find(&rows).Error; err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to fetch digital transactions"})
+		}
+
+		return c.JSON(rows)
+	})
+
+	app.Get("/api/exports/digital-transactions.csv", Protected(), func(c *fiber.Ctx) error {
+		dateFrom := strings.TrimSpace(c.Query("date_from"))
+		dateTo := strings.TrimSpace(c.Query("date_to"))
+		status := strings.TrimSpace(c.Query("status"))
+		txType := strings.TrimSpace(c.Query("type"))
+		provider := strings.TrimSpace(c.Query("provider"))
+
+		if dateFrom != "" {
+			if _, err := time.Parse("2006-01-02", dateFrom); err != nil {
+				return c.Status(400).JSON(fiber.Map{"error": "Invalid date_from"})
+			}
+		}
+		if dateTo != "" {
+			if _, err := time.Parse("2006-01-02", dateTo); err != nil {
+				return c.Status(400).JSON(fiber.Map{"error": "Invalid date_to"})
+			}
+		}
+
+		query := DB.Model(&DigitalTransaction{}).Order("created_at desc")
+		if dateFrom != "" {
+			query = query.Where("DATE(created_at) >= ?", dateFrom)
+		}
+		if dateTo != "" {
+			query = query.Where("DATE(created_at) <= ?", dateTo)
+		}
+		if status != "" {
+			query = query.Where("status = ?", status)
+		}
+		if txType != "" {
+			query = query.Where("transaction_type = ?", txType)
+		}
+		if provider != "" {
+			query = query.Where("provider LIKE ?", "%"+provider+"%")
+		}
+
+		var rows []DigitalTransaction
+		if err := query.Find(&rows).Error; err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to fetch digital transactions"})
+		}
+
+		csvRows := make([][]string, 0, len(rows))
+		for _, row := range rows {
+			csvRows = append(csvRows, []string{
+				strconv.FormatUint(uint64(row.ID), 10),
+				row.CreatedAt.Format("2006-01-02 15:04:05"),
+				row.TransactionType,
+				row.Provider,
+				row.CustomerNumber,
+				row.ProductName,
+				formatCSVNumber(row.BuyPrice),
+				formatCSVNumber(row.SellPrice),
+				formatCSVNumber(row.Profit),
+				row.Status,
+				row.Source,
+				row.MitraRef,
+				row.CreatedBy,
+				row.Notes,
+			})
+		}
+
+		filename := fmt.Sprintf("transaksi_digital_%s.csv", time.Now().Format("20060102_150405"))
+		return sendCSV(c, filename, []string{"id", "created_at", "transaction_type", "provider", "customer_number", "product_name", "buy_price", "sell_price", "profit", "status", "source", "mitra_ref", "created_by", "notes"}, csvRows)
+	})
+
+	app.Patch("/api/digital-transactions/:id/status", Protected(), func(c *fiber.Ctx) error {
+		id := c.Params("id")
+
+		type updateStatusRequest struct {
+			Status string `json:"status"`
+			Notes  string `json:"notes"`
+		}
+
+		var req updateStatusRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
+		}
+
+		status := strings.ToLower(strings.TrimSpace(req.Status))
+		if status != "pending" && status != "success" && status != "failed" {
+			return c.Status(400).JSON(fiber.Map{"error": "status must be pending, success, or failed"})
+		}
+
+		updates := map[string]interface{}{"status": status}
+		if notes := strings.TrimSpace(req.Notes); notes != "" {
+			updates["notes"] = notes
+		}
+
+		if err := DB.Model(&DigitalTransaction{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to update status"})
+		}
+
+		var row DigitalTransaction
+		if err := DB.First(&row, id).Error; err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "Digital transaction not found"})
+		}
+
+		logActivity(c, "update_transaksi_digital", row.CustomerNumber, fmt.Sprintf("status: %s", row.Status))
+		return c.JSON(row)
 	})
 
 	// --- CATEGORY MANAGEMENT ---
@@ -1274,6 +1762,10 @@ func main() {
 			}
 
 			for _, item := range transaction.Items {
+				if item.IsVoided {
+					continue
+				}
+
 				entry := productSales[item.ProductName]
 				entry.Name = item.ProductName
 				entry.QtySold += item.Qty
@@ -1308,6 +1800,101 @@ func main() {
 		response["best_selling_products"] = bestProducts
 
 		return c.JSON(response)
+	})
+	// DIGITAL TRANSACTION REPORT
+	app.Get("/api/reports/digital-summary", Protected(), func(c *fiber.Ctx) error {
+		now := time.Now()
+		defaultFrom := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+		defaultTo := now.Format("2006-01-02")
+		dateFrom := strings.TrimSpace(c.Query("date_from", defaultFrom))
+		dateTo := strings.TrimSpace(c.Query("date_to", defaultTo))
+
+		if _, err := time.Parse("2006-01-02", dateFrom); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid date_from"})
+		}
+		if _, err := time.Parse("2006-01-02", dateTo); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid date_to"})
+		}
+
+		type dStats struct {
+			TotalCount   int64   `json:"total_count"`
+			SuccessCount int64   `json:"success_count"`
+			FailedCount  int64   `json:"failed_count"`
+			PendingCount int64   `json:"pending_count"`
+			TotalOmzet   float64 `json:"total_omzet"`
+			TotalProfit  float64 `json:"total_profit"`
+		}
+		var stats dStats
+		DB.Model(&DigitalTransaction{}).
+			Where("DATE(created_at) >= ? AND DATE(created_at) <= ?", dateFrom, dateTo).
+			Select("COUNT(*) as total_count, " +
+				"SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success_count, " +
+				"SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed_count, " +
+				"SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) as pending_count, " +
+				"SUM(CASE WHEN status='success' THEN sell_price ELSE 0 END) as total_omzet, " +
+				"SUM(CASE WHEN status='success' THEN profit ELSE 0 END) as total_profit").
+			Scan(&stats)
+
+		type dTypeBreakdown struct {
+			Type   string  `json:"type"`
+			Count  int64   `json:"count"`
+			Omzet  float64 `json:"omzet"`
+			Profit float64 `json:"profit"`
+		}
+		byType := []dTypeBreakdown{}
+		DB.Model(&DigitalTransaction{}).
+			Where("DATE(created_at) >= ? AND DATE(created_at) <= ?", dateFrom, dateTo).
+			Select("transaction_type as type, COUNT(*) as count, " +
+				"SUM(CASE WHEN status='success' THEN sell_price ELSE 0 END) as omzet, " +
+				"SUM(CASE WHEN status='success' THEN profit ELSE 0 END) as profit").
+			Group("transaction_type").
+			Scan(&byType)
+
+		type dProviderBreakdown struct {
+			Provider string  `json:"provider"`
+			Count    int64   `json:"count"`
+			Omzet    float64 `json:"omzet"`
+			Profit   float64 `json:"profit"`
+		}
+		byProvider := []dProviderBreakdown{}
+		DB.Model(&DigitalTransaction{}).
+			Where("DATE(created_at) >= ? AND DATE(created_at) <= ? AND TRIM(provider) != ''", dateFrom, dateTo).
+			Select("provider, COUNT(*) as count, " +
+				"SUM(CASE WHEN status='success' THEN sell_price ELSE 0 END) as omzet, " +
+				"SUM(CASE WHEN status='success' THEN profit ELSE 0 END) as profit").
+			Group("provider").
+			Order("count desc").
+			Scan(&byProvider)
+
+		type dDailyPoint struct {
+			Date   string  `json:"date"`
+			Count  int64   `json:"count"`
+			Omzet  float64 `json:"omzet"`
+			Profit float64 `json:"profit"`
+		}
+		daily := []dDailyPoint{}
+		DB.Model(&DigitalTransaction{}).
+			Where("DATE(created_at) >= ? AND DATE(created_at) <= ?", dateFrom, dateTo).
+			Select("DATE(created_at) as date, COUNT(*) as count, " +
+				"SUM(CASE WHEN status='success' THEN sell_price ELSE 0 END) as omzet, " +
+				"SUM(CASE WHEN status='success' THEN profit ELSE 0 END) as profit").
+			Group("DATE(created_at)").
+			Order("date asc").
+			Scan(&daily)
+
+		return c.JSON(fiber.Map{
+			"date_from":     dateFrom,
+			"date_to":       dateTo,
+			"total_count":   stats.TotalCount,
+			"success_count": stats.SuccessCount,
+			"failed_count":  stats.FailedCount,
+			"pending_count": stats.PendingCount,
+			"total_omzet":   stats.TotalOmzet,
+			"total_profit":  stats.TotalProfit,
+			"by_type":       byType,
+			"by_provider":   byProvider,
+			"daily":         daily,
+		})
 	})
 
 	// GET Activity Logs - Admin Only
