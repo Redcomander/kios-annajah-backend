@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -52,8 +51,8 @@ type ProductBatch struct {
 	ID           uint       `gorm:"primaryKey" json:"id"`
 	ProductID    uint       `gorm:"index" json:"product_id"`
 	Qty          float64    `json:"qty"`
-	RemainingQty float64    `json:"remaining_qty"`
-	ExpiredAt    *time.Time `json:"expired_at,omitempty"`
+	RemainingQty float64    `gorm:"index" json:"remaining_qty"`
+	ExpiredAt    *time.Time `gorm:"index" json:"expired_at,omitempty"`
 	CreatedAt    time.Time  `json:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at"`
 }
@@ -70,13 +69,13 @@ type Unit struct {
 
 type TransactionItem struct {
 	ID            uint       `gorm:"primaryKey" json:"id"`
-	TransactionID uint       `json:"transaction_id"`
-	ProductID     uint       `json:"product_id"`
+	TransactionID uint       `gorm:"index" json:"transaction_id"`
+	ProductID     uint       `gorm:"index" json:"product_id"`
 	ProductName   string     `json:"product_name"`
 	Qty           float64    `json:"qty"`
 	Price         float64    `json:"price"`
 	CostPrice     float64    `json:"cost_price"`
-	IsVoided      bool       `gorm:"default:false" json:"is_voided"`
+	IsVoided      bool       `gorm:"default:false;index" json:"is_voided"`
 	VoidedAt      *time.Time `json:"voided_at,omitempty"`
 	VoidReason    string     `json:"void_reason,omitempty"`
 }
@@ -85,8 +84,8 @@ type Transaction struct {
 	ID            uint              `gorm:"primaryKey" json:"id"`
 	TotalAmount   float64           `json:"total_amount"`
 	PaymentMethod string            `json:"payment_method"`
-	CreatedAt     time.Time         `json:"created_at"`
-	IsVoided      bool              `gorm:"default:false" json:"is_voided"`
+	CreatedAt     time.Time         `gorm:"index" json:"created_at"`
+	IsVoided      bool              `gorm:"default:false;index" json:"is_voided"`
 	VoidedAt      *time.Time        `json:"voided_at,omitempty"`
 	VoidReason    string            `json:"void_reason,omitempty"`
 	Items         []TransactionItem `json:"items" gorm:"foreignKey:TransactionID"`
@@ -94,31 +93,31 @@ type Transaction struct {
 
 type DigitalTransaction struct {
 	ID              uint      `gorm:"primaryKey" json:"id"`
-	TransactionType string    `json:"transaction_type"` // pulsa, paket_data
-	Provider        string    `json:"provider"`
+	TransactionType string    `gorm:"index" json:"transaction_type"` // pulsa, paket_data
+	Provider        string    `gorm:"index" json:"provider"`
 	CustomerNumber  string    `json:"customer_number"`
 	ProductName     string    `json:"product_name"`
 	BuyPrice        float64   `json:"buy_price"`
 	SellPrice       float64   `json:"sell_price"`
 	Profit          float64   `json:"profit"`
-	Status          string    `json:"status"` // pending, success, failed
+	Status          string    `gorm:"index" json:"status"` // pending, success, failed
 	Source          string    `json:"source"` // manual, assisted
 	MitraRef        string    `json:"mitra_ref"`
 	Notes           string    `json:"notes"`
 	CreatedByID     uint      `json:"created_by_id"`
 	CreatedBy       string    `json:"created_by"`
-	CreatedAt       time.Time `json:"created_at"`
+	CreatedAt       time.Time `gorm:"index" json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 type ActivityLog struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
 	UserID    uint      `json:"user_id"`
-	Username  string    `json:"username"`
-	Action    string    `json:"action"`
+	Username  string    `gorm:"index" json:"username"`
+	Action    string    `gorm:"index" json:"action"`
 	Target    string    `json:"target"`
 	Details   string    `json:"details"`
-	CreatedAt time.Time `json:"created_at"`
+	CreatedAt time.Time `gorm:"index" json:"created_at"`
 }
 
 var DB *gorm.DB
@@ -311,19 +310,44 @@ func syncTransactionVoidState(tx *gorm.DB, transactionID uint, fallbackReason st
 }
 
 func enrichProductsWithAlerts(products []Product) []Product {
+	if len(products) == 0 {
+		return products
+	}
+
 	now := time.Now()
 	nearExpiryCutoff := now.AddDate(0, 0, nearExpiryDays)
 
+	// Set low-stock flags in one pass
 	for i := range products {
 		products[i].LowStock = products[i].Stock <= lowStockThreshold
+	}
 
-		var batch ProductBatch
-		err := DB.Where("product_id = ? AND remaining_qty > 0 AND expired_at IS NOT NULL", products[i].ID).
-			Order("expired_at asc").
-			First(&batch).Error
-		if err == nil && batch.ExpiredAt != nil {
-			products[i].NearestExpired = batch.ExpiredAt
-			products[i].NearExpiry = batch.ExpiredAt.Before(nearExpiryCutoff) || batch.ExpiredAt.Equal(nearExpiryCutoff)
+	// Single batch query for earliest expiry per product — replaces N+1 loop
+	productIDs := make([]uint, len(products))
+	for i, p := range products {
+		productIDs[i] = p.ID
+	}
+
+	type batchMin struct {
+		ProductID    uint       `gorm:"column:product_id"`
+		MinExpiredAt *time.Time `gorm:"column:min_expired_at"`
+	}
+	var batchRows []batchMin
+	DB.Model(&ProductBatch{}).
+		Select("product_id, MIN(expired_at) as min_expired_at").
+		Where("product_id IN ? AND remaining_qty > 0 AND expired_at IS NOT NULL", productIDs).
+		Group("product_id").
+		Scan(&batchRows)
+
+	expiryMap := make(map[uint]*time.Time, len(batchRows))
+	for _, row := range batchRows {
+		expiryMap[row.ProductID] = row.MinExpiredAt
+	}
+
+	for i := range products {
+		if minExp, ok := expiryMap[products[i].ID]; ok && minExp != nil {
+			products[i].NearestExpired = minExp
+			products[i].NearExpiry = minExp.Before(nearExpiryCutoff) || minExp.Equal(nearExpiryCutoff)
 		}
 	}
 
@@ -1628,48 +1652,51 @@ func main() {
 	// --- REPORTS ---
 	app.Get("/api/reports/chart", Protected(), func(c *fiber.Ctx) error {
 		period := c.Query("period", "daily")
-		var results []struct {
-			Date  string  `json:"date"`
-			Total float64 `json:"total"`
+
+		// Use SQL GROUP BY — avoids loading all transactions into memory
+		var dateExpr string
+		if resolveDatabaseDriver() == "sqlite" {
+			switch period {
+			case "daily":
+				dateExpr = "strftime('%Y-%m-%d', created_at)"
+			case "monthly":
+				dateExpr = "strftime('%Y-%m', created_at)"
+			case "yearly":
+				dateExpr = "strftime('%Y', created_at)"
+			default:
+				return c.Status(400).JSON(fiber.Map{"error": "Invalid period"})
+			}
+		} else {
+			switch period {
+			case "daily":
+				dateExpr = "TO_CHAR(created_at, 'YYYY-MM-DD')"
+			case "monthly":
+				dateExpr = "TO_CHAR(created_at, 'YYYY-MM')"
+			case "yearly":
+				dateExpr = "TO_CHAR(created_at, 'YYYY')"
+			default:
+				return c.Status(400).JSON(fiber.Map{"error": "Invalid period"})
+			}
 		}
 
-		layout := "2006-01-02"
-		switch period {
-		case "daily":
-			layout = "2006-01-02"
-		case "monthly":
-			layout = "2006-01"
-		case "yearly":
-			layout = "2006"
-		default:
-			return c.Status(400).JSON(fiber.Map{"error": "Invalid period"})
+		type chartPoint struct {
+			Date  string  `gorm:"column:date" json:"date"`
+			Total float64 `gorm:"column:total" json:"total"`
 		}
-
-		var transactions []Transaction
-		if err := DB.Where("is_voided = ?", false).Order("created_at asc").Find(&transactions).Error; err != nil {
+		var results []chartPoint
+		if err := DB.Model(&Transaction{}).
+			Where("is_voided = ?", false).
+			Select(fmt.Sprintf("%s as date, SUM(total_amount) as total", dateExpr)).
+			Group(dateExpr).
+			Order(dateExpr + " asc").
+			Scan(&results).Error; err != nil {
 			log.Println("Report Error:", err)
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to generate report"})
 		}
 
-		grouped := map[string]float64{}
-		for _, transaction := range transactions {
-			key := transaction.CreatedAt.Format(layout)
-			grouped[key] += transaction.TotalAmount
+		if results == nil {
+			results = []chartPoint{}
 		}
-
-		keys := make([]string, 0, len(grouped))
-		for key := range grouped {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-
-		for _, key := range keys {
-			results = append(results, struct {
-				Date  string  `json:"date"`
-				Total float64 `json:"total"`
-			}{Date: key, Total: grouped[key]})
-		}
-
 		return c.JSON(results)
 	})
 
@@ -1691,8 +1718,9 @@ func main() {
 		startOfDay := targetDate
 		endOfDay := startOfDay.Add(24 * time.Hour)
 
+		// Load transactions without items — items are aggregated via a separate SQL query below
 		var transactions []Transaction
-		if err := DB.Preload("Items").Where("created_at >= ? AND created_at < ? AND is_voided = ?", startOfDay, endOfDay, false).Order("created_at asc").Find(&transactions).Error; err != nil {
+		if err := DB.Where("created_at >= ? AND created_at < ? AND is_voided = ?", startOfDay, endOfDay, false).Order("created_at asc").Find(&transactions).Error; err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to generate daily summary"})
 		}
 
@@ -1730,7 +1758,6 @@ func main() {
 
 		payments := response["payments"].(fiber.Map)
 		shifts := response["shifts"].([]shiftSummary)
-		productSales := map[string]bestSellingProduct{}
 
 		for _, transaction := range transactions {
 			response["transaction_count"] = response["transaction_count"].(int) + 1
@@ -1760,39 +1787,25 @@ func main() {
 				shifts[2].TransactionCount++
 				shifts[2].Total += transaction.TotalAmount
 			}
-
-			for _, item := range transaction.Items {
-				if item.IsVoided {
-					continue
-				}
-
-				entry := productSales[item.ProductName]
-				entry.Name = item.ProductName
-				entry.QtySold += item.Qty
-				entry.Revenue += float64(item.Qty) * item.Price
-				productSales[item.ProductName] = entry
-			}
 		}
 
 		if response["transaction_count"].(int) > 0 {
 			response["average_ticket"] = response["total"].(float64) / float64(response["transaction_count"].(int))
 		}
 
-		bestProducts := make([]bestSellingProduct, 0, len(productSales))
-		for _, product := range productSales {
-			bestProducts = append(bestProducts, product)
-		}
-
-		sort.Slice(bestProducts, func(i, j int) bool {
-			if bestProducts[i].QtySold == bestProducts[j].QtySold {
-				return bestProducts[i].Revenue > bestProducts[j].Revenue
-			}
-
-			return bestProducts[i].QtySold > bestProducts[j].QtySold
-		})
-
-		if len(bestProducts) > 5 {
-			bestProducts = bestProducts[:5]
+		// Best-selling products via SQL GROUP BY — no in-memory aggregation needed
+		var bestProducts []bestSellingProduct
+		DB.Model(&TransactionItem{}).
+			Joins("JOIN transactions ON transactions.id = transaction_items.transaction_id").
+			Where("transactions.created_at >= ? AND transactions.created_at < ? AND transactions.is_voided = ? AND transaction_items.is_voided = ?",
+				startOfDay, endOfDay, false, false).
+			Select("transaction_items.product_name as name, SUM(transaction_items.qty) as qty_sold, SUM(transaction_items.qty * transaction_items.price) as revenue").
+			Group("transaction_items.product_name").
+			Order("qty_sold desc, revenue desc").
+			Limit(5).
+			Scan(&bestProducts)
+		if bestProducts == nil {
+			bestProducts = []bestSellingProduct{}
 		}
 
 		response["payments"] = payments
