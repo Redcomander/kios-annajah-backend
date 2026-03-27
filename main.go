@@ -92,22 +92,33 @@ type Transaction struct {
 }
 
 type DigitalTransaction struct {
-	ID              uint      `gorm:"primaryKey" json:"id"`
-	TransactionType string    `gorm:"index" json:"transaction_type"` // pulsa, paket_data
-	Provider        string    `gorm:"index" json:"provider"`
-	CustomerNumber  string    `json:"customer_number"`
-	ProductName     string    `json:"product_name"`
-	BuyPrice        float64   `json:"buy_price"`
-	SellPrice       float64   `json:"sell_price"`
-	Profit          float64   `json:"profit"`
-	Status          string    `gorm:"index" json:"status"` // pending, success, failed
-	Source          string    `json:"source"`              // manual, assisted
-	MitraRef        string    `json:"mitra_ref"`
-	Notes           string    `json:"notes"`
-	CreatedByID     uint      `json:"created_by_id"`
-	CreatedBy       string    `json:"created_by"`
-	CreatedAt       time.Time `gorm:"index" json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ID              uint       `gorm:"primaryKey" json:"id"`
+	TransactionType string     `gorm:"index" json:"transaction_type"` // pulsa, paket_data
+	Provider        string     `gorm:"index" json:"provider"`
+	CustomerNumber  string     `gorm:"index" json:"customer_number"`
+	ProductName     string     `json:"product_name"`
+	BuyPrice        float64    `json:"buy_price"`
+	SellPrice       float64    `json:"sell_price"`
+	Fee             float64    `json:"fee"`
+	AdminFee        float64    `json:"admin_fee"`
+	Commission      float64    `json:"commission"`
+	Profit          float64    `json:"profit"`
+	Status          string     `gorm:"index" json:"status"` // pending, success, failed
+	Source          string     `json:"source"`              // manual, assisted
+	MitraRef        string     `gorm:"index" json:"mitra_ref"`
+	FailureReason   string     `json:"failure_reason"`
+	ReceiptImage    string     `json:"receipt_image"`
+	OCRText         string     `gorm:"type:text" json:"ocr_text"`
+	Notes           string     `json:"notes"`
+	CreatedByID     uint       `json:"created_by_id"`
+	CreatedBy       string     `json:"created_by"`
+	UpdatedByID     uint       `json:"updated_by_id"`
+	UpdatedBy       string     `json:"updated_by"`
+	IsVoided        bool       `gorm:"default:false;index" json:"is_voided"`
+	VoidedAt        *time.Time `json:"voided_at,omitempty"`
+	VoidReason      string     `json:"void_reason,omitempty"`
+	CreatedAt       time.Time  `gorm:"index" json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 type ActivityLog struct {
@@ -221,6 +232,90 @@ func parseOptionalDate(value string) (*time.Time, error) {
 	}
 
 	return &t, nil
+}
+
+func normalizeCustomerNumber(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+
+	var digits strings.Builder
+	for _, char := range trimmed {
+		if char >= '0' && char <= '9' {
+			digits.WriteRune(char)
+		}
+	}
+
+	number := digits.String()
+	if number == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(number, "0") {
+		return "62" + strings.TrimPrefix(number, "0")
+	}
+	if strings.HasPrefix(number, "8") {
+		return "62" + number
+	}
+
+	return number
+}
+
+func calculateDigitalProfit(sellPrice, buyPrice, fee, adminFee, commission float64) float64 {
+	return sellPrice - buyPrice - fee - adminFee + commission
+}
+
+var digitalProviderCatalog = map[string]string{
+	"telkomsel": "Telkomsel",
+	"indosat":   "Indosat",
+	"tri":       "Tri",
+	"xl":        "XL",
+	"axis":      "Axis",
+	"smartfren": "Smartfren",
+	"byu":       "By.U",
+	"dana":      "DANA",
+	"ovo":       "OVO",
+	"gopay":     "GoPay",
+	"linkaja":   "LinkAja",
+}
+
+var digitalFailureReasonCatalog = map[string]string{
+	"provider_timeout":     "Provider Timeout",
+	"invalid_destination":  "Invalid Destination",
+	"insufficient_balance": "Insufficient Balance",
+	"provider_rejected":    "Provider Rejected",
+	"network_error":        "Network Error",
+	"duplicate_request":    "Duplicate Request",
+	"customer_cancelled":   "Customer Cancelled",
+	"other":                "Other",
+}
+
+func normalizeDigitalProvider(value string) (string, bool) {
+	key := strings.ToLower(strings.TrimSpace(value))
+	key = strings.ReplaceAll(key, ".", "")
+	key = strings.ReplaceAll(key, "-", "")
+	key = strings.ReplaceAll(key, " ", "")
+
+	canonical, ok := digitalProviderCatalog[key]
+	if !ok {
+		return "", false
+	}
+
+	return canonical, true
+}
+
+func normalizeFailureReasonCode(value string) (string, bool) {
+	key := strings.ToLower(strings.TrimSpace(value))
+	key = strings.ReplaceAll(key, "-", "_")
+	key = strings.ReplaceAll(key, " ", "_")
+
+	_, ok := digitalFailureReasonCatalog[key]
+	if !ok {
+		return "", false
+	}
+
+	return key, true
 }
 
 func formatCSVNumber(value float64) string {
@@ -480,6 +575,9 @@ func main() {
 
 	if err := ensureDir(uploadsDir); err != nil {
 		log.Fatalf("Failed to create uploads directory: %v", err)
+	}
+	if err := ensureDir(filepath.Join(uploadsDir, "digital-receipts")); err != nil {
+		log.Fatalf("Failed to create digital receipt uploads directory: %v", err)
 	}
 
 	app := fiber.New()
@@ -1323,6 +1421,43 @@ func main() {
 		return c.JSON(updated)
 	})
 
+	app.Post("/api/digital-transactions/receipt", Protected(), func(c *fiber.Ctx) error {
+		file, err := c.FormFile("receipt")
+		if err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "receipt image is required"})
+		}
+
+		receiptDir := filepath.Join(uploadsDir, "digital-receipts")
+		if err := ensureDir(receiptDir); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to prepare receipt directory"})
+		}
+
+		safeFileName := strings.ReplaceAll(filepath.Base(file.Filename), " ", "_")
+		filename := fmt.Sprintf("digital_receipt_%d_%s", time.Now().UnixNano(), safeFileName)
+		if err := c.SaveFile(file, filepath.Join(receiptDir, filename)); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to save receipt image"})
+		}
+
+		return c.JSON(fiber.Map{"receipt_image": "/uploads/digital-receipts/" + filename})
+	})
+
+	app.Get("/api/digital-transactions/meta", Protected(), func(c *fiber.Ctx) error {
+		providers := make([]fiber.Map, 0, len(digitalProviderCatalog))
+		for _, label := range []string{"Telkomsel", "Indosat", "Tri", "XL", "Axis", "Smartfren", "By.U", "DANA", "OVO", "GoPay", "LinkAja"} {
+			providers = append(providers, fiber.Map{"value": label, "label": label})
+		}
+
+		failureReasons := make([]fiber.Map, 0, len(digitalFailureReasonCatalog))
+		for _, code := range []string{"provider_timeout", "invalid_destination", "insufficient_balance", "provider_rejected", "network_error", "duplicate_request", "customer_cancelled", "other"} {
+			failureReasons = append(failureReasons, fiber.Map{"value": code, "label": digitalFailureReasonCatalog[code]})
+		}
+
+		return c.JSON(fiber.Map{
+			"providers":       providers,
+			"failure_reasons": failureReasons,
+		})
+	})
+
 	app.Post("/api/digital-transactions", Protected(), func(c *fiber.Ctx) error {
 		type DigitalTransactionRequest struct {
 			TransactionType string  `json:"transaction_type"`
@@ -1331,9 +1466,15 @@ func main() {
 			ProductName     string  `json:"product_name"`
 			BuyPrice        float64 `json:"buy_price"`
 			SellPrice       float64 `json:"sell_price"`
+			Fee             float64 `json:"fee"`
+			AdminFee        float64 `json:"admin_fee"`
+			Commission      float64 `json:"commission"`
 			Status          string  `json:"status"`
 			Source          string  `json:"source"`
 			MitraRef        string  `json:"mitra_ref"`
+			FailureReason   string  `json:"failure_reason"`
+			ReceiptImage    string  `json:"receipt_image"`
+			OCRText         string  `json:"ocr_text"`
 			Notes           string  `json:"notes"`
 		}
 
@@ -1347,14 +1488,29 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "transaction_type must be pulsa or paket_data"})
 		}
 
-		customerNumber := strings.TrimSpace(req.CustomerNumber)
-		if customerNumber == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "customer_number is required"})
+		provider, providerOK := normalizeDigitalProvider(req.Provider)
+		if !providerOK {
+			return c.Status(400).JSON(fiber.Map{"error": "provider must be one of supported Mitra providers"})
+		}
+
+		customerNumber := normalizeCustomerNumber(req.CustomerNumber)
+		if customerNumber == "" || len(customerNumber) < 10 {
+			return c.Status(400).JSON(fiber.Map{"error": "customer_number is required and must be valid"})
 		}
 
 		productName := strings.TrimSpace(req.ProductName)
 		if productName == "" {
 			return c.Status(400).JSON(fiber.Map{"error": "product_name is required"})
+		}
+
+		mitraRef := strings.ToUpper(strings.TrimSpace(req.MitraRef))
+		if mitraRef == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "mitra_ref is required"})
+		}
+
+		receiptImage := strings.TrimSpace(req.ReceiptImage)
+		if receiptImage == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "receipt_image is required"})
 		}
 
 		status := strings.ToLower(strings.TrimSpace(req.Status))
@@ -1373,34 +1529,63 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "source must be manual or assisted"})
 		}
 
-		if req.BuyPrice < 0 || req.SellPrice < 0 {
-			return c.Status(400).JSON(fiber.Map{"error": "price must be >= 0"})
+		if req.BuyPrice <= 0 || req.SellPrice <= 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "buy_price and sell_price must be > 0"})
+		}
+		if req.Fee < 0 || req.AdminFee < 0 || req.Commission < 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "fee/admin_fee/commission must be >= 0"})
+		}
+
+		failureReason := ""
+		if status == "failed" {
+			var reasonOK bool
+			failureReason, reasonOK = normalizeFailureReasonCode(req.FailureReason)
+			if !reasonOK {
+				return c.Status(400).JSON(fiber.Map{"error": "failure_reason must be a valid code"})
+			}
+		}
+
+		var duplicateCount int64
+		DB.Model(&DigitalTransaction{}).
+			Where("is_voided = ? AND mitra_ref = ? AND customer_number = ? AND sell_price = ? AND created_at >= ?", false, mitraRef, customerNumber, req.SellPrice, time.Now().Add(-10*time.Minute)).
+			Count(&duplicateCount)
+		if duplicateCount > 0 {
+			return c.Status(409).JSON(fiber.Map{"error": "Potential duplicate transaction detected (same mitra_ref/number/nominal in last 10 minutes)"})
 		}
 
 		username, _ := c.Locals("username").(string)
 		userIDFloat, _ := c.Locals("user_id").(float64)
+		userID := uint(userIDFloat)
 
 		record := DigitalTransaction{
 			TransactionType: typeValue,
-			Provider:        strings.TrimSpace(req.Provider),
+			Provider:        provider,
 			CustomerNumber:  customerNumber,
 			ProductName:     productName,
 			BuyPrice:        req.BuyPrice,
 			SellPrice:       req.SellPrice,
-			Profit:          req.SellPrice - req.BuyPrice,
+			Fee:             req.Fee,
+			AdminFee:        req.AdminFee,
+			Commission:      req.Commission,
+			Profit:          calculateDigitalProfit(req.SellPrice, req.BuyPrice, req.Fee, req.AdminFee, req.Commission),
 			Status:          status,
 			Source:          source,
-			MitraRef:        strings.TrimSpace(req.MitraRef),
+			MitraRef:        mitraRef,
+			FailureReason:   failureReason,
+			ReceiptImage:    receiptImage,
+			OCRText:         strings.TrimSpace(req.OCRText),
 			Notes:           strings.TrimSpace(req.Notes),
-			CreatedByID:     uint(userIDFloat),
+			CreatedByID:     userID,
 			CreatedBy:       username,
+			UpdatedByID:     userID,
+			UpdatedBy:       username,
 		}
 
 		if err := DB.Create(&record).Error; err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to save digital transaction"})
 		}
 
-		logActivity(c, "catat_transaksi_digital", record.CustomerNumber, fmt.Sprintf("%s %s %.0f", record.TransactionType, record.ProductName, record.SellPrice))
+		logActivity(c, "catat_transaksi_digital", record.CustomerNumber, fmt.Sprintf("trx_id:%d | %s %s %.0f", record.ID, record.TransactionType, record.ProductName, record.SellPrice))
 		return c.JSON(record)
 	})
 
@@ -1410,7 +1595,12 @@ func main() {
 			limit = 300
 		}
 
+		includeVoided := strings.EqualFold(strings.TrimSpace(c.Query("include_voided")), "true") || c.Query("include_voided") == "1"
+
 		q := DB.Model(&DigitalTransaction{}).Order("created_at desc")
+		if !includeVoided {
+			q = q.Where("is_voided = ?", false)
+		}
 
 		if dateFrom := strings.TrimSpace(c.Query("date_from")); dateFrom != "" {
 			q = q.Where("DATE(created_at) >= ?", dateFrom)
@@ -1427,6 +1617,9 @@ func main() {
 		if provider := strings.TrimSpace(c.Query("provider")); provider != "" {
 			q = q.Where("provider LIKE ?", "%"+provider+"%")
 		}
+		if mitraRef := strings.TrimSpace(c.Query("mitra_ref")); mitraRef != "" {
+			q = q.Where("mitra_ref LIKE ?", "%"+strings.ToUpper(mitraRef)+"%")
+		}
 
 		var rows []DigitalTransaction
 		if err := q.Limit(limit).Find(&rows).Error; err != nil {
@@ -1436,12 +1629,34 @@ func main() {
 		return c.JSON(rows)
 	})
 
+	app.Get("/api/digital-transactions/:id", Protected(), func(c *fiber.Ctx) error {
+		id := c.Params("id")
+
+		var row DigitalTransaction
+		if err := DB.First(&row, id).Error; err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "Digital transaction not found"})
+		}
+
+		marker := fmt.Sprintf("trx_id:%d", row.ID)
+		var activities []ActivityLog
+		DB.Where("action IN ? AND details LIKE ?", []string{"catat_transaksi_digital", "update_transaksi_digital", "void_transaksi_digital"}, "%"+marker+"%").
+			Order("created_at asc").
+			Find(&activities)
+
+		return c.JSON(fiber.Map{
+			"transaction": row,
+			"timeline":    activities,
+		})
+	})
+
 	app.Get("/api/exports/digital-transactions.csv", Protected(), func(c *fiber.Ctx) error {
 		dateFrom := strings.TrimSpace(c.Query("date_from"))
 		dateTo := strings.TrimSpace(c.Query("date_to"))
 		status := strings.TrimSpace(c.Query("status"))
 		txType := strings.TrimSpace(c.Query("type"))
 		provider := strings.TrimSpace(c.Query("provider"))
+		mitraRef := strings.TrimSpace(c.Query("mitra_ref"))
+		includeVoided := strings.EqualFold(strings.TrimSpace(c.Query("include_voided")), "true") || c.Query("include_voided") == "1"
 
 		if dateFrom != "" {
 			if _, err := time.Parse("2006-01-02", dateFrom); err != nil {
@@ -1455,6 +1670,9 @@ func main() {
 		}
 
 		query := DB.Model(&DigitalTransaction{}).Order("created_at desc")
+		if !includeVoided {
+			query = query.Where("is_voided = ?", false)
+		}
 		if dateFrom != "" {
 			query = query.Where("DATE(created_at) >= ?", dateFrom)
 		}
@@ -1470,6 +1688,9 @@ func main() {
 		if provider != "" {
 			query = query.Where("provider LIKE ?", "%"+provider+"%")
 		}
+		if mitraRef != "" {
+			query = query.Where("mitra_ref LIKE ?", "%"+strings.ToUpper(mitraRef)+"%")
+		}
 
 		var rows []DigitalTransaction
 		if err := query.Find(&rows).Error; err != nil {
@@ -1478,6 +1699,11 @@ func main() {
 
 		csvRows := make([][]string, 0, len(rows))
 		for _, row := range rows {
+			voidedAt := ""
+			if row.VoidedAt != nil {
+				voidedAt = row.VoidedAt.Format("2006-01-02 15:04:05")
+			}
+
 			csvRows = append(csvRows, []string{
 				strconv.FormatUint(uint64(row.ID), 10),
 				row.CreatedAt.Format("2006-01-02 15:04:05"),
@@ -1487,25 +1713,35 @@ func main() {
 				row.ProductName,
 				formatCSVNumber(row.BuyPrice),
 				formatCSVNumber(row.SellPrice),
+				formatCSVNumber(row.Fee),
+				formatCSVNumber(row.AdminFee),
+				formatCSVNumber(row.Commission),
 				formatCSVNumber(row.Profit),
 				row.Status,
 				row.Source,
 				row.MitraRef,
+				row.FailureReason,
+				row.ReceiptImage,
+				strconv.FormatBool(row.IsVoided),
+				voidedAt,
+				row.VoidReason,
 				row.CreatedBy,
+				row.UpdatedBy,
 				row.Notes,
 			})
 		}
 
 		filename := fmt.Sprintf("transaksi_digital_%s.csv", time.Now().Format("20060102_150405"))
-		return sendCSV(c, filename, []string{"id", "created_at", "transaction_type", "provider", "customer_number", "product_name", "buy_price", "sell_price", "profit", "status", "source", "mitra_ref", "created_by", "notes"}, csvRows)
+		return sendCSV(c, filename, []string{"id", "created_at", "transaction_type", "provider", "customer_number", "product_name", "buy_price", "sell_price", "fee", "admin_fee", "commission", "profit", "status", "source", "mitra_ref", "failure_reason", "receipt_image", "is_voided", "voided_at", "void_reason", "created_by", "updated_by", "notes"}, csvRows)
 	})
 
 	app.Patch("/api/digital-transactions/:id/status", Protected(), func(c *fiber.Ctx) error {
 		id := c.Params("id")
 
 		type updateStatusRequest struct {
-			Status string `json:"status"`
-			Notes  string `json:"notes"`
+			Status        string `json:"status"`
+			Notes         string `json:"notes"`
+			FailureReason string `json:"failure_reason"`
 		}
 
 		var req updateStatusRequest
@@ -1518,21 +1754,95 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "status must be pending, success, or failed"})
 		}
 
-		updates := map[string]interface{}{"status": status}
+		var row DigitalTransaction
+		if err := DB.First(&row, id).Error; err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "Digital transaction not found"})
+		}
+		if row.IsVoided {
+			return c.Status(409).JSON(fiber.Map{"error": "Cannot update status for voided transaction"})
+		}
+
+		failureReason := ""
+		if status == "failed" {
+			var reasonOK bool
+			failureReason, reasonOK = normalizeFailureReasonCode(req.FailureReason)
+			if !reasonOK {
+				return c.Status(400).JSON(fiber.Map{"error": "failure_reason must be a valid code"})
+			}
+		}
+
+		username, _ := c.Locals("username").(string)
+		userIDFloat, _ := c.Locals("user_id").(float64)
+
+		updates := map[string]interface{}{
+			"status":         status,
+			"updated_by_id":  uint(userIDFloat),
+			"updated_by":     username,
+			"failure_reason": "",
+		}
 		if notes := strings.TrimSpace(req.Notes); notes != "" {
 			updates["notes"] = notes
+		}
+		if status == "failed" {
+			updates["failure_reason"] = failureReason
 		}
 
 		if err := DB.Model(&DigitalTransaction{}).Where("id = ?", id).Updates(updates).Error; err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to update status"})
 		}
 
-		var row DigitalTransaction
 		if err := DB.First(&row, id).Error; err != nil {
 			return c.Status(404).JSON(fiber.Map{"error": "Digital transaction not found"})
 		}
 
-		logActivity(c, "update_transaksi_digital", row.CustomerNumber, fmt.Sprintf("status: %s", row.Status))
+		logActivity(c, "update_transaksi_digital", row.CustomerNumber, fmt.Sprintf("trx_id:%d | status: %s", row.ID, row.Status))
+		return c.JSON(row)
+	})
+
+	app.Patch("/api/digital-transactions/:id/void", Protected(), func(c *fiber.Ctx) error {
+		id := c.Params("id")
+
+		type voidRequest struct {
+			Reason string `json:"reason"`
+		}
+
+		var req voidRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
+		}
+
+		reason := strings.TrimSpace(req.Reason)
+		if reason == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "reason is required"})
+		}
+
+		var row DigitalTransaction
+		if err := DB.First(&row, id).Error; err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "Digital transaction not found"})
+		}
+		if row.IsVoided {
+			return c.Status(409).JSON(fiber.Map{"error": "Transaction already voided"})
+		}
+
+		now := time.Now()
+		username, _ := c.Locals("username").(string)
+		userIDFloat, _ := c.Locals("user_id").(float64)
+
+		if err := DB.Model(&DigitalTransaction{}).Where("id = ?", id).Updates(map[string]interface{}{
+			"is_voided":     true,
+			"voided_at":     &now,
+			"void_reason":   reason,
+			"updated_by_id": uint(userIDFloat),
+			"updated_by":    username,
+		}).Error; err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to void transaction"})
+		}
+
+		if err := DB.First(&row, id).Error; err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "Digital transaction not found"})
+		}
+
+		logActivity(c, "void_transaksi_digital", row.CustomerNumber, fmt.Sprintf("trx_id:%d | %s", row.ID, reason))
 		return c.JSON(row)
 	})
 
@@ -1839,7 +2149,7 @@ func main() {
 		}
 		var stats dStats
 		DB.Model(&DigitalTransaction{}).
-			Where("DATE(created_at) >= ? AND DATE(created_at) <= ?", dateFrom, dateTo).
+			Where("DATE(created_at) >= ? AND DATE(created_at) <= ? AND is_voided = ?", dateFrom, dateTo, false).
 			Select("COUNT(*) as total_count, " +
 				"SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success_count, " +
 				"SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed_count, " +
@@ -1856,7 +2166,7 @@ func main() {
 		}
 		byType := []dTypeBreakdown{}
 		DB.Model(&DigitalTransaction{}).
-			Where("DATE(created_at) >= ? AND DATE(created_at) <= ?", dateFrom, dateTo).
+			Where("DATE(created_at) >= ? AND DATE(created_at) <= ? AND is_voided = ?", dateFrom, dateTo, false).
 			Select("transaction_type as type, COUNT(*) as count, " +
 				"SUM(CASE WHEN status='success' THEN sell_price ELSE 0 END) as omzet, " +
 				"SUM(CASE WHEN status='success' THEN profit ELSE 0 END) as profit").
@@ -1871,7 +2181,7 @@ func main() {
 		}
 		byProvider := []dProviderBreakdown{}
 		DB.Model(&DigitalTransaction{}).
-			Where("DATE(created_at) >= ? AND DATE(created_at) <= ? AND TRIM(provider) != ''", dateFrom, dateTo).
+			Where("DATE(created_at) >= ? AND DATE(created_at) <= ? AND TRIM(provider) != '' AND is_voided = ?", dateFrom, dateTo, false).
 			Select("provider, COUNT(*) as count, " +
 				"SUM(CASE WHEN status='success' THEN sell_price ELSE 0 END) as omzet, " +
 				"SUM(CASE WHEN status='success' THEN profit ELSE 0 END) as profit").
@@ -1887,7 +2197,7 @@ func main() {
 		}
 		daily := []dDailyPoint{}
 		DB.Model(&DigitalTransaction{}).
-			Where("DATE(created_at) >= ? AND DATE(created_at) <= ?", dateFrom, dateTo).
+			Where("DATE(created_at) >= ? AND DATE(created_at) <= ? AND is_voided = ?", dateFrom, dateTo, false).
 			Select("DATE(created_at) as date, COUNT(*) as count, " +
 				"SUM(CASE WHEN status='success' THEN sell_price ELSE 0 END) as omzet, " +
 				"SUM(CASE WHEN status='success' THEN profit ELSE 0 END) as profit").
