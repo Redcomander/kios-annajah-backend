@@ -93,7 +93,7 @@ type Transaction struct {
 
 type DigitalTransaction struct {
 	ID              uint       `gorm:"primaryKey" json:"id"`
-	TransactionType string     `gorm:"index" json:"transaction_type"` // pulsa, paket_data
+	TransactionType string     `gorm:"index" json:"transaction_type"` // pulsa, paket_data, ewallet_topup, pln_token, bill_payment, voucher_game, emoney_topup, other
 	Provider        string     `gorm:"index" json:"provider"`
 	CustomerNumber  string     `gorm:"index" json:"customer_number"`
 	ProductName     string     `json:"product_name"`
@@ -262,6 +262,11 @@ func normalizeCustomerNumber(value string) string {
 	return number
 }
 
+func isValidDigitalDestination(value string) bool {
+	normalized := normalizeCustomerNumber(value)
+	return len(normalized) >= 5
+}
+
 func calculateDigitalProfit(sellPrice, buyPrice, fee, adminFee, commission float64) float64 {
 	return sellPrice - buyPrice - fee - adminFee + commission
 }
@@ -274,10 +279,39 @@ var digitalProviderCatalog = map[string]string{
 	"axis":      "Axis",
 	"smartfren": "Smartfren",
 	"byu":       "By.U",
+	"pln":       "PLN",
+	"bpjs":      "BPJS",
+	"pdam":      "PDAM",
+	"indihome":  "IndiHome",
+	"telkom":    "Telkom",
 	"dana":      "DANA",
 	"ovo":       "OVO",
 	"gopay":     "GoPay",
 	"linkaja":   "LinkAja",
+	"shopeepay": "ShopeePay",
+	"emoney":    "e-Money",
+	"emandiri":  "e-Money",
+	"brizzi":    "BRIZZI",
+	"flazz":     "Flazz",
+	"tapcash":   "TapCash",
+	"garena":    "Garena",
+	"freefire":  "Free Fire",
+	"mobilelegends": "Mobile Legends",
+	"ml":        "Mobile Legends",
+	"steam":     "Steam",
+	"googleplay": "Google Play",
+	"other":     "Other",
+}
+
+var digitalTransactionTypeCatalog = map[string]string{
+	"pulsa":         "Pulsa",
+	"paket_data":    "Paket Data",
+	"ewallet_topup": "Top Up E-Wallet",
+	"pln_token":     "Token PLN",
+	"bill_payment":  "Tagihan",
+	"voucher_game":  "Voucher/Game",
+	"emoney_topup":  "Top Up E-Money",
+	"other":         "Lainnya",
 }
 
 var digitalFailureReasonCatalog = map[string]string{
@@ -311,6 +345,19 @@ func normalizeFailureReasonCode(value string) (string, bool) {
 	key = strings.ReplaceAll(key, " ", "_")
 
 	_, ok := digitalFailureReasonCatalog[key]
+	if !ok {
+		return "", false
+	}
+
+	return key, true
+}
+
+func normalizeDigitalTransactionType(value string) (string, bool) {
+	key := strings.ToLower(strings.TrimSpace(value))
+	key = strings.ReplaceAll(key, "-", "_")
+	key = strings.ReplaceAll(key, " ", "_")
+
+	_, ok := digitalTransactionTypeCatalog[key]
 	if !ok {
 		return "", false
 	}
@@ -1443,8 +1490,13 @@ func main() {
 
 	app.Get("/api/digital-transactions/meta", Protected(), func(c *fiber.Ctx) error {
 		providers := make([]fiber.Map, 0, len(digitalProviderCatalog))
-		for _, label := range []string{"Telkomsel", "Indosat", "Tri", "XL", "Axis", "Smartfren", "By.U", "DANA", "OVO", "GoPay", "LinkAja"} {
+		for _, label := range []string{"Telkomsel", "Indosat", "Tri", "XL", "Axis", "Smartfren", "By.U", "PLN", "BPJS", "PDAM", "IndiHome", "Telkom", "DANA", "OVO", "GoPay", "LinkAja", "ShopeePay", "e-Money", "BRIZZI", "Flazz", "TapCash", "Garena", "Free Fire", "Mobile Legends", "Steam", "Google Play", "Other"} {
 			providers = append(providers, fiber.Map{"value": label, "label": label})
+		}
+
+		transactionTypes := make([]fiber.Map, 0, len(digitalTransactionTypeCatalog))
+		for _, code := range []string{"pulsa", "paket_data", "ewallet_topup", "pln_token", "bill_payment", "voucher_game", "emoney_topup", "other"} {
+			transactionTypes = append(transactionTypes, fiber.Map{"value": code, "label": digitalTransactionTypeCatalog[code]})
 		}
 
 		failureReasons := make([]fiber.Map, 0, len(digitalFailureReasonCatalog))
@@ -1453,6 +1505,7 @@ func main() {
 		}
 
 		return c.JSON(fiber.Map{
+			"transaction_types": transactionTypes,
 			"providers":       providers,
 			"failure_reasons": failureReasons,
 		})
@@ -1483,9 +1536,9 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
 		}
 
-		typeValue := strings.ToLower(strings.TrimSpace(req.TransactionType))
-		if typeValue != "pulsa" && typeValue != "paket_data" {
-			return c.Status(400).JSON(fiber.Map{"error": "transaction_type must be pulsa or paket_data"})
+		typeValue, typeOK := normalizeDigitalTransactionType(req.TransactionType)
+		if !typeOK {
+			return c.Status(400).JSON(fiber.Map{"error": "transaction_type must be a supported Mitra product family"})
 		}
 
 		provider, providerOK := normalizeDigitalProvider(req.Provider)
@@ -1494,8 +1547,8 @@ func main() {
 		}
 
 		customerNumber := normalizeCustomerNumber(req.CustomerNumber)
-		if customerNumber == "" || len(customerNumber) < 10 {
-			return c.Status(400).JSON(fiber.Map{"error": "customer_number is required and must be valid"})
+		if !isValidDigitalDestination(req.CustomerNumber) {
+			return c.Status(400).JSON(fiber.Map{"error": "destination/customer ID is required and must be valid"})
 		}
 
 		productName := strings.TrimSpace(req.ProductName)
