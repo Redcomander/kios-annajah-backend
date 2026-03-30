@@ -226,12 +226,33 @@ func parseOptionalDate(value string) (*time.Time, error) {
 		return nil, nil
 	}
 
-	t, err := time.Parse("2006-01-02", trimmed)
-	if err != nil {
-		return nil, err
+	// Treat zero-like placeholders as empty to avoid storing year 0001 values.
+	if trimmed == "0001-01-01" || strings.HasPrefix(trimmed, "0001-01-01T") {
+		return nil, nil
 	}
 
-	return &t, nil
+	layouts := []string{
+		"2006-01-02",
+		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02T15:04:05",
+		"02/01/2006",
+		"2/1/2006",
+	}
+
+	var parsed time.Time
+	var err error
+	for _, layout := range layouts {
+		parsed, err = time.Parse(layout, trimmed)
+		if err == nil {
+			t := parsed
+			if t.Year() < 1900 {
+				return nil, nil
+			}
+			return &t, nil
+		}
+	}
+
+	return nil, fmt.Errorf("invalid date format")
 }
 
 func normalizeCustomerNumber(value string) string {
@@ -1034,8 +1055,10 @@ func main() {
 	app.Post("/api/products/:id/restock", Protected(), func(c *fiber.Ctx) error {
 
 		type RestockRequest struct {
-			Qty       float64 `json:"qty"`
-			ExpiredAt string  `json:"expired_at"`
+			Qty       float64  `json:"qty"`
+			ExpiredAt string   `json:"expired_at"`
+			Price     *float64 `json:"price"`
+			CostPrice *float64 `json:"cost_price"`
 		}
 
 		id := c.Params("id")
@@ -1064,6 +1087,30 @@ func main() {
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to update stock"})
 		}
 
+		if req.Price != nil {
+			if *req.Price < 0 {
+				tx.Rollback()
+				return c.Status(400).JSON(fiber.Map{"error": "Harga jual tidak boleh negatif"})
+			}
+			if err := tx.Model(&Product{}).Where("id = ?", product.ID).Update("price", *req.Price).Error; err != nil {
+				tx.Rollback()
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to update selling price"})
+			}
+			product.Price = *req.Price
+		}
+
+		if req.CostPrice != nil {
+			if *req.CostPrice < 0 {
+				tx.Rollback()
+				return c.Status(400).JSON(fiber.Map{"error": "Harga beli tidak boleh negatif"})
+			}
+			if err := tx.Model(&Product{}).Where("id = ?", product.ID).Update("cost_price", *req.CostPrice).Error; err != nil {
+				tx.Rollback()
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to update cost price"})
+			}
+			product.CostPrice = *req.CostPrice
+		}
+
 		batch := ProductBatch{
 			ProductID:    product.ID,
 			Qty:          req.Qty,
@@ -1076,7 +1123,11 @@ func main() {
 		}
 
 		tx.Commit()
-		logActivity(c, "tambah_stok", product.Name, fmt.Sprintf("+%.3f unit", req.Qty))
+		priceInfo := ""
+		if req.CostPrice != nil || req.Price != nil {
+			priceInfo = fmt.Sprintf(" | cost: %.0f | sell: %.0f", product.CostPrice, product.Price)
+		}
+		logActivity(c, "tambah_stok", product.Name, fmt.Sprintf("+%.3f unit%s", req.Qty, priceInfo))
 		return c.JSON(fiber.Map{"message": "Stock updated", "batch": batch})
 	})
 
