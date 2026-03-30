@@ -966,6 +966,24 @@ func main() {
 			}
 		}
 
+		shouldUpdateExpiredAt := false
+		var updatedExpiredAt *time.Time
+		if form, err := c.MultipartForm(); err == nil {
+			if values, ok := form.Value["expired_at"]; ok {
+				shouldUpdateExpiredAt = true
+				rawExpiredAt := ""
+				if len(values) > 0 {
+					rawExpiredAt = values[0]
+				}
+
+				parsedExpiredAt, parseErr := parseOptionalDate(rawExpiredAt)
+				if parseErr != nil {
+					return c.Status(400).JSON(fiber.Map{"error": "Invalid expired date format. Use YYYY-MM-DD"})
+				}
+				updatedExpiredAt = parsedExpiredAt
+			}
+		}
+
 		// Handle Image Upload
 		if file, err := c.FormFile("image"); err == nil {
 			filename := fmt.Sprintf("%d_%s", time.Now().Unix(), file.Filename)
@@ -975,7 +993,18 @@ func main() {
 			product.Image = "/uploads/" + filename
 		}
 
-		DB.Save(&product)
+		if err := DB.Save(&product).Error; err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to update product"})
+		}
+
+		if shouldUpdateExpiredAt {
+			if err := DB.Model(&ProductBatch{}).
+				Where("product_id = ? AND remaining_qty > 0", product.ID).
+				Update("expired_at", updatedExpiredAt).Error; err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to update product expiry"})
+			}
+		}
+
 		logActivity(c, "edit_produk", product.Name, fmt.Sprintf("harga: %.0f, stok: %.3f", product.Price, product.Stock))
 		return c.JSON(product)
 	})
