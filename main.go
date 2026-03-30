@@ -998,10 +998,24 @@ func main() {
 		}
 
 		if shouldUpdateExpiredAt {
-			if err := DB.Model(&ProductBatch{}).
+			result := DB.Model(&ProductBatch{}).
 				Where("product_id = ? AND remaining_qty > 0", product.ID).
-				Update("expired_at", updatedExpiredAt).Error; err != nil {
+				Update("expired_at", updatedExpiredAt)
+			if result.Error != nil {
 				return c.Status(500).JSON(fiber.Map{"error": "Failed to update product expiry"})
+			}
+
+			// Backfill a batch when legacy products have stock but no active batch rows.
+			if result.RowsAffected == 0 && updatedExpiredAt != nil && product.Stock > 0 {
+				fallbackBatch := ProductBatch{
+					ProductID:    product.ID,
+					Qty:          product.Stock,
+					RemainingQty: product.Stock,
+					ExpiredAt:    updatedExpiredAt,
+				}
+				if err := DB.Create(&fallbackBatch).Error; err != nil {
+					return c.Status(500).JSON(fiber.Map{"error": "Failed to create fallback expiry batch"})
+				}
 			}
 		}
 
