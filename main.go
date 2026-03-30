@@ -233,7 +233,11 @@ func parseOptionalDate(value string) (*time.Time, error) {
 
 	layouts := []string{
 		"2006-01-02",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05Z07:00",
 		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02T15:04:05.999999999Z07:00",
 		"2006-01-02T15:04:05",
 		"02/01/2006",
 		"2/1/2006",
@@ -492,8 +496,8 @@ func enrichProductsWithAlerts(products []Product) []Product {
 	}
 
 	type batchMin struct {
-		ProductID    uint       `gorm:"column:product_id"`
-		MinExpiredAt *time.Time `gorm:"column:min_expired_at"`
+		ProductID    uint   `gorm:"column:product_id"`
+		MinExpiredAt string `gorm:"column:min_expired_at"`
 	}
 	var batchRows []batchMin
 	DB.Model(&ProductBatch{}).
@@ -504,7 +508,11 @@ func enrichProductsWithAlerts(products []Product) []Product {
 
 	expiryMap := make(map[uint]*time.Time, len(batchRows))
 	for _, row := range batchRows {
-		expiryMap[row.ProductID] = row.MinExpiredAt
+		parsed, err := parseOptionalDate(row.MinExpiredAt)
+		if err != nil || parsed == nil {
+			continue
+		}
+		expiryMap[row.ProductID] = parsed
 	}
 
 	for i := range products {
