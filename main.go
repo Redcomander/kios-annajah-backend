@@ -43,6 +43,10 @@ type Product struct {
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`
 	NearestExpired *time.Time `gorm:"-" json:"nearest_expired_at,omitempty"`
+	InputtedAt     *time.Time `gorm:"-" json:"inputted_at,omitempty"`
+	LastSoldAt     *time.Time `gorm:"-" json:"last_sold_at,omitempty"`
+	UnsoldForMonth bool       `gorm:"-" json:"unsold_for_month"`
+	UnsoldDays     int        `gorm:"-" json:"unsold_days"`
 	NearExpiry     bool       `gorm:"-" json:"near_expiry"`
 	LowStock       bool       `gorm:"-" json:"low_stock"`
 }
@@ -91,6 +95,30 @@ type Transaction struct {
 	Items         []TransactionItem `json:"items" gorm:"foreignKey:TransactionID"`
 }
 
+type CreditPayment struct {
+	ID           uint      `gorm:"primaryKey" json:"id"`
+	CreditSaleID uint      `gorm:"index" json:"credit_sale_id"`
+	Amount       float64   `json:"amount"`
+	Note         string    `json:"note"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+type CreditSale struct {
+	ID              uint            `gorm:"primaryKey" json:"id"`
+	TransactionID   uint            `gorm:"index" json:"transaction_id"`
+	TotalAmount     float64         `json:"total_amount"`
+	CustomerName    string          `gorm:"not null" json:"customer_name"`
+	WaNumber        string          `json:"wa_number"`
+	DueDate         time.Time       `gorm:"index" json:"due_date"`
+	IsPaid          bool            `gorm:"default:false;index" json:"is_paid"`
+	PaidAt          *time.Time      `json:"paid_at,omitempty"`
+	CreatedAt       time.Time       `json:"created_at"`
+	Payments        []CreditPayment `gorm:"foreignKey:CreditSaleID" json:"payments"`
+	AmountPaid      float64         `gorm:"-" json:"amount_paid"`
+	RemainingAmount float64         `gorm:"-" json:"remaining_amount"`
+	IsOverdue       bool            `gorm:"-" json:"is_overdue"`
+}
+
 type DigitalTransaction struct {
 	ID              uint       `gorm:"primaryKey" json:"id"`
 	TransactionType string     `gorm:"index" json:"transaction_type"` // pulsa, paket_data, ewallet_topup, pln_token, bill_payment, voucher_game, emoney_topup, other
@@ -131,12 +159,26 @@ type ActivityLog struct {
 	CreatedAt time.Time `gorm:"index" json:"created_at"`
 }
 
+type OperationalNote struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	EntryType string    `gorm:"index" json:"entry_type"`
+	Category  string    `gorm:"index" json:"category"`
+	Title     string    `json:"title"`
+	Note      string    `gorm:"type:text" json:"note"`
+	Amount    float64   `json:"amount"`
+	EntryDate time.Time `gorm:"index" json:"entry_date"`
+	CreatedBy string    `gorm:"index" json:"created_by"`
+	CreatedAt time.Time `gorm:"index" json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 var DB *gorm.DB
 var jwtSecret []byte
 var uploadsDir string
 
 const lowStockThreshold = 10
 const nearExpiryDays = 14
+const unsoldWarningDays = 30
 
 func getEnv(key, fallback string) string {
 	value := os.Getenv(key)
@@ -209,7 +251,7 @@ func ConnectDB() error {
 
 	log.Println("Connected to Database!")
 
-	if err := DB.AutoMigrate(&Product{}, &ProductBatch{}, &Transaction{}, &TransactionItem{}, &DigitalTransaction{}, &Category{}, &Unit{}, &User{}, &ActivityLog{}); err != nil {
+	if err := DB.AutoMigrate(&Product{}, &ProductBatch{}, &Transaction{}, &TransactionItem{}, &CreditPayment{}, &CreditSale{}, &DigitalTransaction{}, &Category{}, &Unit{}, &User{}, &ActivityLog{}, &OperationalNote{}); err != nil {
 		return fmt.Errorf("auto migrate schema: %w", err)
 	}
 
@@ -296,6 +338,22 @@ func calculateDigitalProfit(sellPrice, buyPrice, fee, adminFee, commission float
 	return sellPrice - buyPrice - fee - adminFee + commission
 }
 
+func calculateDigitalProfitByType(transactionType string, sellPrice, buyPrice, fee, adminFee, commission float64) float64 {
+	if transactionType == "topup_saldo_fee" {
+		expenseBase := sellPrice
+		if expenseBase <= 0 {
+			expenseBase = buyPrice
+		}
+		expense := expenseBase + fee + adminFee
+		if expense < 0 {
+			expense = -expense
+		}
+		return -(expense) + commission
+	}
+
+	return calculateDigitalProfit(sellPrice, buyPrice, fee, adminFee, commission)
+}
+
 var digitalProviderCatalog = map[string]string{
 	"telkomsel":     "Telkomsel",
 	"indosat":       "Indosat",
@@ -329,14 +387,15 @@ var digitalProviderCatalog = map[string]string{
 }
 
 var digitalTransactionTypeCatalog = map[string]string{
-	"pulsa":         "Pulsa",
-	"paket_data":    "Paket Data",
-	"ewallet_topup": "Top Up E-Wallet",
-	"pln_token":     "Token PLN",
-	"bill_payment":  "Tagihan",
-	"voucher_game":  "Voucher/Game",
-	"emoney_topup":  "Top Up E-Money",
-	"other":         "Lainnya",
+	"pulsa":           "Pulsa",
+	"paket_data":      "Paket Data",
+	"ewallet_topup":   "Top Up E-Wallet",
+	"pln_token":       "Token PLN",
+	"bill_payment":    "Tagihan",
+	"voucher_game":    "Voucher/Game",
+	"emoney_topup":    "Top Up E-Money",
+	"topup_saldo_fee": "Biaya Top Up Saldo",
+	"other":           "Lainnya",
 }
 
 var digitalFailureReasonCatalog = map[string]string{
@@ -499,12 +558,35 @@ func enrichProductsWithAlerts(products []Product) []Product {
 		ProductID    uint   `gorm:"column:product_id"`
 		MinExpiredAt string `gorm:"column:min_expired_at"`
 	}
+	type batchLatestInput struct {
+		ProductID     uint   `gorm:"column:product_id"`
+		LatestInputAt string `gorm:"column:latest_input_at"`
+	}
+	type productLatestSold struct {
+		ProductID  uint   `gorm:"column:product_id"`
+		LastSoldAt string `gorm:"column:last_sold_at"`
+	}
 	var batchRows []batchMin
 	DB.Model(&ProductBatch{}).
 		Select("product_id, MIN(expired_at) as min_expired_at").
 		Where("product_id IN ? AND remaining_qty > 0 AND expired_at IS NOT NULL", productIDs).
 		Group("product_id").
 		Scan(&batchRows)
+
+	var latestInputRows []batchLatestInput
+	DB.Model(&ProductBatch{}).
+		Select("product_id, MAX(created_at) as latest_input_at").
+		Where("product_id IN ? AND remaining_qty > 0", productIDs).
+		Group("product_id").
+		Scan(&latestInputRows)
+
+	var latestSoldRows []productLatestSold
+	DB.Table("transaction_items as ti").
+		Select("ti.product_id, MAX(t.created_at) as last_sold_at").
+		Joins("JOIN transactions t ON t.id = ti.transaction_id").
+		Where("ti.product_id IN ? AND ti.is_voided = ? AND t.is_voided = ?", productIDs, false, false).
+		Group("ti.product_id").
+		Scan(&latestSoldRows)
 
 	expiryMap := make(map[uint]*time.Time, len(batchRows))
 	for _, row := range batchRows {
@@ -515,11 +597,65 @@ func enrichProductsWithAlerts(products []Product) []Product {
 		expiryMap[row.ProductID] = parsed
 	}
 
+	inputtedMap := make(map[uint]*time.Time, len(latestInputRows))
+	for _, row := range latestInputRows {
+		parsed, err := parseOptionalDate(row.LatestInputAt)
+		if err != nil || parsed == nil {
+			continue
+		}
+		inputtedMap[row.ProductID] = parsed
+	}
+
+	lastSoldMap := make(map[uint]*time.Time, len(latestSoldRows))
+	for _, row := range latestSoldRows {
+		parsed, err := parseOptionalDate(row.LastSoldAt)
+		if err != nil || parsed == nil {
+			continue
+		}
+		lastSoldMap[row.ProductID] = parsed
+	}
+
 	for i := range products {
 		if minExp, ok := expiryMap[products[i].ID]; ok && minExp != nil {
 			products[i].NearestExpired = minExp
 			products[i].NearExpiry = minExp.Before(nearExpiryCutoff) || minExp.Equal(nearExpiryCutoff)
 		}
+
+		if inputtedAt, ok := inputtedMap[products[i].ID]; ok && inputtedAt != nil {
+			products[i].InputtedAt = inputtedAt
+		}
+
+		if lastSoldAt, ok := lastSoldMap[products[i].ID]; ok && lastSoldAt != nil {
+			products[i].LastSoldAt = lastSoldAt
+		}
+
+		if products[i].Stock <= 0 {
+			products[i].UnsoldForMonth = false
+			products[i].UnsoldDays = 0
+			continue
+		}
+
+		baseDate := products[i].CreatedAt
+		if products[i].InputtedAt != nil {
+			baseDate = *products[i].InputtedAt
+		}
+
+		if products[i].LastSoldAt == nil || products[i].LastSoldAt.Before(baseDate) {
+			days := int(now.Sub(baseDate).Hours() / 24)
+			if days < 0 {
+				days = 0
+			}
+			products[i].UnsoldDays = days
+			products[i].UnsoldForMonth = days >= unsoldWarningDays
+			continue
+		}
+
+		daysSinceSold := int(now.Sub(*products[i].LastSoldAt).Hours() / 24)
+		if daysSinceSold < 0 {
+			daysSinceSold = 0
+		}
+		products[i].UnsoldDays = daysSinceSold
+		products[i].UnsoldForMonth = daysSinceSold >= unsoldWarningDays
 	}
 
 	return products
@@ -1082,6 +1218,11 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid expired date format. Use YYYY-MM-DD"})
 		}
 
+		inputtedAt, err := parseOptionalDate(c.FormValue("inputted_at"))
+		if err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid input date format. Use YYYY-MM-DD"})
+		}
+
 		if DB != nil {
 			if err := DB.Create(product).Error; err != nil {
 				return c.Status(500).JSON(fiber.Map{"error": err.Error()})
@@ -1093,6 +1234,9 @@ func main() {
 					Qty:          product.Stock,
 					RemainingQty: product.Stock,
 					ExpiredAt:    expiredAt,
+				}
+				if inputtedAt != nil {
+					batch.CreatedAt = *inputtedAt
 				}
 				if err := DB.Create(&batch).Error; err != nil {
 					return c.Status(500).JSON(fiber.Map{"error": "Product created but failed to save stock batch"})
@@ -1106,10 +1250,11 @@ func main() {
 	app.Post("/api/products/:id/restock", Protected(), func(c *fiber.Ctx) error {
 
 		type RestockRequest struct {
-			Qty       float64  `json:"qty"`
-			ExpiredAt string   `json:"expired_at"`
-			Price     *float64 `json:"price"`
-			CostPrice *float64 `json:"cost_price"`
+			Qty        float64  `json:"qty"`
+			InputtedAt string   `json:"inputted_at"`
+			ExpiredAt  string   `json:"expired_at"`
+			Price      *float64 `json:"price"`
+			CostPrice  *float64 `json:"cost_price"`
 		}
 
 		id := c.Params("id")
@@ -1125,6 +1270,11 @@ func main() {
 		expiredAt, err := parseOptionalDate(req.ExpiredAt)
 		if err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid expired date format. Use YYYY-MM-DD"})
+		}
+
+		inputtedAt, err := parseOptionalDate(req.InputtedAt)
+		if err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid input date format. Use YYYY-MM-DD"})
 		}
 
 		var product Product
@@ -1168,6 +1318,9 @@ func main() {
 			RemainingQty: req.Qty,
 			ExpiredAt:    expiredAt,
 		}
+		if inputtedAt != nil {
+			batch.CreatedAt = *inputtedAt
+		}
 		if err := tx.Create(&batch).Error; err != nil {
 			tx.Rollback()
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to save stock batch"})
@@ -1188,6 +1341,8 @@ func main() {
 			Total         float64           `json:"total"`
 			PaymentMethod string            `json:"paymentMethod"`
 			Items         []TransactionItem `json:"items"`
+			CustomerName  string            `json:"customer_name"`
+			WaNumber      string            `json:"wa_number"`
 		}
 
 		req := new(CheckoutRequest)
@@ -1271,6 +1426,21 @@ func main() {
 		}
 
 		tx.Commit()
+
+		// If paying on credit, create a CreditSale record
+		if req.PaymentMethod == "kredit" && strings.TrimSpace(req.CustomerName) != "" {
+			dueDate := time.Now().AddDate(0, 0, 7)
+			credit := CreditSale{
+				TransactionID: transaction.ID,
+				TotalAmount:   req.Total,
+				CustomerName:  strings.TrimSpace(req.CustomerName),
+				WaNumber:      strings.TrimSpace(req.WaNumber),
+				DueDate:       dueDate,
+				CreatedAt:     time.Now(),
+			}
+			_ = DB.Create(&credit).Error
+		}
+
 		logActivity(c, "checkout", fmt.Sprintf("%d item", len(req.Items)), fmt.Sprintf("total: %.0f, metode: %s", req.Total, req.PaymentMethod))
 		return c.JSON(fiber.Map{"message": "Transaction success", "id": transaction.ID})
 	})
@@ -1597,7 +1767,7 @@ func main() {
 		}
 
 		transactionTypes := make([]fiber.Map, 0, len(digitalTransactionTypeCatalog))
-		for _, code := range []string{"pulsa", "paket_data", "ewallet_topup", "pln_token", "bill_payment", "voucher_game", "emoney_topup", "other"} {
+		for _, code := range []string{"pulsa", "paket_data", "ewallet_topup", "pln_token", "bill_payment", "voucher_game", "emoney_topup", "topup_saldo_fee", "other"} {
 			transactionTypes = append(transactionTypes, fiber.Map{"value": code, "label": digitalTransactionTypeCatalog[code]})
 		}
 
@@ -1643,38 +1813,28 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "transaction_type must be a supported Mitra product family"})
 		}
 
-		provider, providerOK := normalizeDigitalProvider(req.Provider)
-		if !providerOK {
-			return c.Status(400).JSON(fiber.Map{"error": "provider must be one of supported Mitra providers"})
+		provider := "Other"
+		if strings.TrimSpace(req.Provider) != "" {
+			normalizedProvider, providerOK := normalizeDigitalProvider(req.Provider)
+			if providerOK {
+				provider = normalizedProvider
+			} else {
+				provider = strings.TrimSpace(req.Provider)
+			}
 		}
 
 		customerNumber := normalizeCustomerNumber(req.CustomerNumber)
-		if !isValidDigitalDestination(req.CustomerNumber) {
-			return c.Status(400).JSON(fiber.Map{"error": "destination/customer ID is required and must be valid"})
-		}
 
 		productName := strings.TrimSpace(req.ProductName)
 		if productName == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "product_name is required"})
+			productName = digitalTransactionTypeCatalog[typeValue]
 		}
 
 		mitraRef := strings.ToUpper(strings.TrimSpace(req.MitraRef))
-		if mitraRef == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "mitra_ref is required"})
-		}
 
 		receiptImage := strings.TrimSpace(req.ReceiptImage)
-		if receiptImage == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "receipt_image is required"})
-		}
 
-		status := strings.ToLower(strings.TrimSpace(req.Status))
-		if status == "" {
-			status = "pending"
-		}
-		if status != "pending" && status != "success" && status != "failed" {
-			return c.Status(400).JSON(fiber.Map{"error": "status must be pending, success, or failed"})
-		}
+		status := "success"
 
 		source := strings.ToLower(strings.TrimSpace(req.Source))
 		if source == "" {
@@ -1684,28 +1844,20 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "source must be manual or assisted"})
 		}
 
-		if req.BuyPrice <= 0 || req.SellPrice <= 0 {
-			return c.Status(400).JSON(fiber.Map{"error": "buy_price and sell_price must be > 0"})
-		}
-		if req.Fee < 0 || req.AdminFee < 0 || req.Commission < 0 {
-			return c.Status(400).JSON(fiber.Map{"error": "fee/admin_fee/commission must be >= 0"})
+		if req.BuyPrice < 0 || req.SellPrice < 0 || req.Fee < 0 || req.AdminFee < 0 || req.Commission < 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "buy_price/sell_price/fee/admin_fee/commission must be >= 0"})
 		}
 
 		failureReason := ""
-		if status == "failed" {
-			var reasonOK bool
-			failureReason, reasonOK = normalizeFailureReasonCode(req.FailureReason)
-			if !reasonOK {
-				return c.Status(400).JSON(fiber.Map{"error": "failure_reason must be a valid code"})
-			}
-		}
 
 		var duplicateCount int64
-		DB.Model(&DigitalTransaction{}).
-			Where("is_voided = ? AND mitra_ref = ? AND customer_number = ? AND sell_price = ? AND created_at >= ?", false, mitraRef, customerNumber, req.SellPrice, time.Now().Add(-10*time.Minute)).
-			Count(&duplicateCount)
-		if duplicateCount > 0 {
-			return c.Status(409).JSON(fiber.Map{"error": "Potential duplicate transaction detected (same mitra_ref/number/nominal in last 10 minutes)"})
+		if mitraRef != "" && customerNumber != "" && req.SellPrice > 0 {
+			DB.Model(&DigitalTransaction{}).
+				Where("is_voided = ? AND mitra_ref = ? AND customer_number = ? AND sell_price = ? AND created_at >= ?", false, mitraRef, customerNumber, req.SellPrice, time.Now().Add(-10*time.Minute)).
+				Count(&duplicateCount)
+			if duplicateCount > 0 {
+				return c.Status(409).JSON(fiber.Map{"error": "Potential duplicate transaction detected (same mitra_ref/number/nominal in last 10 minutes)"})
+			}
 		}
 
 		username, _ := c.Locals("username").(string)
@@ -1722,7 +1874,7 @@ func main() {
 			Fee:             req.Fee,
 			AdminFee:        req.AdminFee,
 			Commission:      req.Commission,
-			Profit:          calculateDigitalProfit(req.SellPrice, req.BuyPrice, req.Fee, req.AdminFee, req.Commission),
+			Profit:          calculateDigitalProfitByType(typeValue, req.SellPrice, req.BuyPrice, req.Fee, req.AdminFee, req.Commission),
 			Status:          status,
 			Source:          source,
 			MitraRef:        mitraRef,
@@ -1904,10 +2056,7 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
 		}
 
-		status := strings.ToLower(strings.TrimSpace(req.Status))
-		if status != "pending" && status != "success" && status != "failed" {
-			return c.Status(400).JSON(fiber.Map{"error": "status must be pending, success, or failed"})
-		}
+		status := "success"
 
 		var row DigitalTransaction
 		if err := DB.First(&row, id).Error; err != nil {
@@ -1918,13 +2067,6 @@ func main() {
 		}
 
 		failureReason := ""
-		if status == "failed" {
-			var reasonOK bool
-			failureReason, reasonOK = normalizeFailureReasonCode(req.FailureReason)
-			if !reasonOK {
-				return c.Status(400).JSON(fiber.Map{"error": "failure_reason must be a valid code"})
-			}
-		}
 
 		username, _ := c.Locals("username").(string)
 		userIDFloat, _ := c.Locals("user_id").(float64)
@@ -1938,9 +2080,7 @@ func main() {
 		if notes := strings.TrimSpace(req.Notes); notes != "" {
 			updates["notes"] = notes
 		}
-		if status == "failed" {
-			updates["failure_reason"] = failureReason
-		}
+		updates["failure_reason"] = failureReason
 
 		if err := DB.Model(&DigitalTransaction{}).Where("id = ?", id).Updates(updates).Error; err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to update status"})
@@ -2375,6 +2515,125 @@ func main() {
 		})
 	})
 
+	// OPERATIONAL NOTES
+	app.Get("/api/operational-notes", Protected(), func(c *fiber.Ctx) error {
+		dateFrom := strings.TrimSpace(c.Query("date_from"))
+		dateTo := strings.TrimSpace(c.Query("date_to"))
+
+		query := DB.Model(&OperationalNote{}).Order("entry_date desc, created_at desc")
+		if dateFrom != "" {
+			if _, err := time.Parse("2006-01-02", dateFrom); err != nil {
+				return c.Status(400).JSON(fiber.Map{"error": "Invalid date_from"})
+			}
+			query = query.Where("DATE(entry_date) >= ?", dateFrom)
+		}
+		if dateTo != "" {
+			if _, err := time.Parse("2006-01-02", dateTo); err != nil {
+				return c.Status(400).JSON(fiber.Map{"error": "Invalid date_to"})
+			}
+			query = query.Where("DATE(entry_date) <= ?", dateTo)
+		}
+
+		var notes []OperationalNote
+		if err := query.Find(&notes).Error; err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to fetch operational notes"})
+		}
+		return c.JSON(notes)
+	})
+
+	app.Post("/api/operational-notes", Protected(), func(c *fiber.Ctx) error {
+		type Request struct {
+			EntryType string  `json:"entry_type"`
+			Category  string  `json:"category"`
+			Title     string  `json:"title"`
+			Note      string  `json:"note"`
+			Amount    float64 `json:"amount"`
+			EntryDate string  `json:"entry_date"`
+		}
+
+		req := new(Request)
+		if err := c.BodyParser(req); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
+		}
+
+		title := strings.TrimSpace(req.Title)
+		noteText := strings.TrimSpace(req.Note)
+		entryType := strings.ToLower(strings.TrimSpace(req.EntryType))
+		category := strings.TrimSpace(req.Category)
+		allowedCategories := map[string]bool{
+			"Operasional Warung":       true,
+			"Operasional Bensin":        true,
+			"Operasional Top Up/Pulsa": true,
+		}
+		if entryType == "" {
+			entryType = "keluar"
+		}
+		if entryType != "masuk" && entryType != "keluar" {
+			return c.Status(400).JSON(fiber.Map{"error": "entry_type must be masuk or keluar"})
+		}
+		if category == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "category is required"})
+		}
+		if !allowedCategories[category] {
+			return c.Status(400).JSON(fiber.Map{"error": "category is invalid"})
+		}
+		if title == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "Title is required"})
+		}
+		if noteText == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "Note is required"})
+		}
+		if req.Amount < 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "Amount must be >= 0"})
+		}
+
+		entryDate := time.Now()
+		if strings.TrimSpace(req.EntryDate) != "" {
+			parsed, err := time.Parse("2006-01-02", strings.TrimSpace(req.EntryDate))
+			if err != nil {
+				return c.Status(400).JSON(fiber.Map{"error": "Invalid entry_date"})
+			}
+			entryDate = parsed
+		}
+
+		createdBy, _ := c.Locals("username").(string)
+		newNote := OperationalNote{
+			EntryType: entryType,
+			Category:  category,
+			Title:     title,
+			Note:      noteText,
+			Amount:    req.Amount,
+			EntryDate: entryDate,
+			CreatedBy: createdBy,
+		}
+
+		if err := DB.Create(&newNote).Error; err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to save operational note"})
+		}
+
+		logActivity(c, "catat_operasional", title, fmt.Sprintf("jenis: %s | kategori: %s | nominal: %.0f", entryType, category, req.Amount))
+		return c.JSON(newNote)
+	})
+
+	app.Delete("/api/operational-notes/:id", Protected(), func(c *fiber.Ctx) error {
+		id, err := strconv.Atoi(c.Params("id"))
+		if err != nil || id <= 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid ID"})
+		}
+
+		var note OperationalNote
+		if err := DB.First(&note, id).Error; err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "Operational note not found"})
+		}
+
+		if err := DB.Delete(&OperationalNote{}, id).Error; err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to delete operational note"})
+		}
+
+		logActivity(c, "hapus_catatan_operasional", note.Title, "")
+		return c.JSON(fiber.Map{"message": "Operational note deleted"})
+	})
+
 	// GET Activity Logs - Admin Only
 	app.Get("/api/activity-logs", Protected(), func(c *fiber.Ctx) error {
 		if c.Locals("role") != "admin" {
@@ -2416,6 +2675,189 @@ func main() {
 			"page":  page,
 			"limit": limit,
 		})
+	})
+
+	// ---- CREDIT SALES (Hutang) ----
+	app.Get("/api/credits", Protected(), func(c *fiber.Ctx) error {
+		var credits []CreditSale
+		if err := DB.Preload("Payments").Order("created_at desc").Find(&credits).Error; err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to fetch credits"})
+		}
+		now := time.Now()
+		for i := range credits {
+			var paid float64
+			for _, p := range credits[i].Payments {
+				paid += p.Amount
+			}
+			credits[i].AmountPaid = paid
+			credits[i].RemainingAmount = credits[i].TotalAmount - paid
+			if credits[i].RemainingAmount < 0 {
+				credits[i].RemainingAmount = 0
+			}
+			if !credits[i].IsPaid && now.After(credits[i].DueDate) {
+				credits[i].IsOverdue = true
+			}
+		}
+		return c.JSON(credits)
+	})
+
+	// POST a partial/full payment (cicilan)
+	app.Post("/api/credits/:id/payment", Protected(), func(c *fiber.Ctx) error {
+		id, err := strconv.Atoi(c.Params("id"))
+		if err != nil || id <= 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid ID"})
+		}
+
+		type PayReq struct {
+			Amount float64 `json:"amount"`
+			Note   string  `json:"note"`
+		}
+		req := new(PayReq)
+		if err := c.BodyParser(req); err != nil || req.Amount <= 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid amount"})
+		}
+
+		var credit CreditSale
+		if err := DB.Preload("Payments").First(&credit, id).Error; err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "Credit not found"})
+		}
+		if credit.IsPaid {
+			return c.Status(400).JSON(fiber.Map{"error": "Already fully paid"})
+		}
+
+		var totalPaid float64
+		for _, p := range credit.Payments {
+			totalPaid += p.Amount
+		}
+		remaining := credit.TotalAmount - totalPaid
+		if req.Amount > remaining {
+			return c.Status(400).JSON(fiber.Map{"error": fmt.Sprintf("Jumlah melebihi sisa hutang (%.0f)", remaining)})
+		}
+
+		payment := CreditPayment{
+			CreditSaleID: uint(id),
+			Amount:       req.Amount,
+			Note:         strings.TrimSpace(req.Note),
+			CreatedAt:    time.Now(),
+		}
+
+		txDB := DB.Begin()
+		if err := txDB.Create(&payment).Error; err != nil {
+			txDB.Rollback()
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to save payment"})
+		}
+
+		// Auto-mark fully paid if remaining is now 0
+		newRemaining := remaining - req.Amount
+		if newRemaining <= 0 {
+			now := time.Now()
+			if err := txDB.Model(&CreditSale{}).Where("id = ?", id).Updates(map[string]interface{}{
+				"is_paid": true,
+				"paid_at": now,
+			}).Error; err != nil {
+				txDB.Rollback()
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to update credit status"})
+			}
+		}
+
+		txDB.Commit()
+		logActivity(c, "cicilan_hutang", fmt.Sprintf("credit#%d", id), fmt.Sprintf("bayar: %.0f, sisa: %.0f", req.Amount, newRemaining))
+		return c.JSON(fiber.Map{"message": "Payment recorded", "remaining": newRemaining, "fully_paid": newRemaining <= 0})
+	})
+
+	app.Patch("/api/credits/:id/pay", Protected(), func(c *fiber.Ctx) error {
+		id, err := strconv.Atoi(c.Params("id"))
+		if err != nil || id <= 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid ID"})
+		}
+
+		var credit CreditSale
+		if err := DB.Preload("Payments").First(&credit, id).Error; err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "Credit not found"})
+		}
+		if credit.IsPaid {
+			return c.JSON(fiber.Map{"message": "Already paid"})
+		}
+
+		// Calculate remaining and add a final payment for the remaining balance
+		var totalPaid float64
+		for _, p := range credit.Payments {
+			totalPaid += p.Amount
+		}
+		remaining := credit.TotalAmount - totalPaid
+		now := time.Now()
+
+		txDB := DB.Begin()
+		if remaining > 0 {
+			finalPayment := CreditPayment{
+				CreditSaleID: uint(id),
+				Amount:       remaining,
+				Note:         "Pelunasan",
+				CreatedAt:    now,
+			}
+			if err := txDB.Create(&finalPayment).Error; err != nil {
+				txDB.Rollback()
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to record final payment"})
+			}
+		}
+		if err := txDB.Model(&CreditSale{}).Where("id = ?", id).Updates(map[string]interface{}{
+			"is_paid": true,
+			"paid_at": now,
+		}).Error; err != nil {
+			txDB.Rollback()
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to mark as paid"})
+		}
+		txDB.Commit()
+		logActivity(c, "lunasi_hutang", fmt.Sprintf("credit#%d", id), "")
+		return c.JSON(fiber.Map{"message": "Marked as paid"})
+	})
+
+	app.Patch("/api/credits/:id/due-date", Protected(), func(c *fiber.Ctx) error {
+		id, err := strconv.Atoi(c.Params("id"))
+		if err != nil || id <= 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid ID"})
+		}
+
+		type DueDateReq struct {
+			DueDate string `json:"due_date"`
+		}
+		req := new(DueDateReq)
+		if err := c.BodyParser(req); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
+		}
+
+		newDueDate, err := time.Parse("2006-01-02", strings.TrimSpace(req.DueDate))
+		if err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid due_date format"})
+		}
+
+		if err := DB.Model(&CreditSale{}).Where("id = ?", id).Update("due_date", newDueDate).Error; err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to update due date"})
+		}
+
+		logActivity(c, "ubah_jatuh_tempo_hutang", fmt.Sprintf("credit#%d", id), newDueDate.Format("2006-01-02"))
+		return c.JSON(fiber.Map{"message": "Due date updated"})
+	})
+
+	app.Delete("/api/credits/:id", Protected(), func(c *fiber.Ctx) error {
+		id, err := strconv.Atoi(c.Params("id"))
+		if err != nil || id <= 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid ID"})
+		}
+
+		txDB := DB.Begin()
+		if err := txDB.Where("credit_sale_id = ?", id).Delete(&CreditPayment{}).Error; err != nil {
+			txDB.Rollback()
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to delete credit payments"})
+		}
+		if err := txDB.Where("id = ?", id).Delete(&CreditSale{}).Error; err != nil {
+			txDB.Rollback()
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to delete credit"})
+		}
+		txDB.Commit()
+
+		logActivity(c, "hapus_hutang", fmt.Sprintf("credit#%d", id), "")
+		return c.JSON(fiber.Map{"message": "Credit deleted"})
 	})
 
 	log.Fatal(app.Listen(":" + getEnv("APP_PORT", "3000")))
