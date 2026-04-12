@@ -5,6 +5,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -163,9 +164,12 @@ type OperationalNote struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
 	EntryType string    `gorm:"index" json:"entry_type"`
 	Category  string    `gorm:"index" json:"category"`
+	IsShoppingNote bool  `gorm:"index" json:"is_shopping_note"`
 	Title     string    `json:"title"`
 	Note      string    `gorm:"type:text" json:"note"`
 	Amount    float64   `json:"amount"`
+	GrossOmzet float64  `json:"gross_omzet"`
+	NetOmzet  float64   `json:"net_omzet"`
 	EntryDate time.Time `gorm:"index" json:"entry_date"`
 	CreatedBy string    `gorm:"index" json:"created_by"`
 	CreatedAt time.Time `gorm:"index" json:"created_at"`
@@ -179,6 +183,11 @@ var uploadsDir string
 const lowStockThreshold = 10
 const nearExpiryDays = 14
 const unsoldWarningDays = 30
+const operationalShoppingMarginRate = 0.125
+
+func roundMoney(value float64) float64 {
+	return math.Round(value*100) / 100
+}
 
 func getEnv(key, fallback string) string {
 	value := os.Getenv(key)
@@ -2519,8 +2528,14 @@ func main() {
 	app.Get("/api/operational-notes", Protected(), func(c *fiber.Ctx) error {
 		dateFrom := strings.TrimSpace(c.Query("date_from"))
 		dateTo := strings.TrimSpace(c.Query("date_to"))
+		shoppingOnly := strings.ToLower(strings.TrimSpace(c.Query("shopping_only")))
 
 		query := DB.Model(&OperationalNote{}).Order("entry_date desc, created_at desc")
+		if shoppingOnly == "true" {
+			query = query.Where("is_shopping_note = ?", true)
+		} else if shoppingOnly == "false" {
+			query = query.Where("is_shopping_note = ?", false)
+		}
 		if dateFrom != "" {
 			if _, err := time.Parse("2006-01-02", dateFrom); err != nil {
 				return c.Status(400).JSON(fiber.Map{"error": "Invalid date_from"})
@@ -2545,9 +2560,11 @@ func main() {
 		type Request struct {
 			EntryType string  `json:"entry_type"`
 			Category  string  `json:"category"`
+			IsShoppingNote bool `json:"is_shopping_note"`
 			Title     string  `json:"title"`
 			Note      string  `json:"note"`
 			Amount    float64 `json:"amount"`
+			GrossOmzet float64 `json:"gross_omzet"`
 			EntryDate string  `json:"entry_date"`
 		}
 
@@ -2586,6 +2603,9 @@ func main() {
 		if req.Amount < 0 {
 			return c.Status(400).JSON(fiber.Map{"error": "Amount must be >= 0"})
 		}
+		if req.GrossOmzet < 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "gross_omzet must be >= 0"})
+		}
 
 		entryDate := time.Now()
 		if strings.TrimSpace(req.EntryDate) != "" {
@@ -2596,13 +2616,23 @@ func main() {
 			entryDate = parsed
 		}
 
+		netOmzet := 0.0
+		grossOmzet := 0.0
+		if req.IsShoppingNote {
+			grossOmzet = roundMoney(req.GrossOmzet)
+			netOmzet = roundMoney(grossOmzet * (1 - operationalShoppingMarginRate))
+		}
+
 		createdBy, _ := c.Locals("username").(string)
 		newNote := OperationalNote{
 			EntryType: entryType,
 			Category:  category,
+			IsShoppingNote: req.IsShoppingNote,
 			Title:     title,
 			Note:      noteText,
 			Amount:    req.Amount,
+			GrossOmzet: grossOmzet,
+			NetOmzet:  netOmzet,
 			EntryDate: entryDate,
 			CreatedBy: createdBy,
 		}
@@ -2611,7 +2641,7 @@ func main() {
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to save operational note"})
 		}
 
-		logActivity(c, "catat_operasional", title, fmt.Sprintf("jenis: %s | kategori: %s | nominal: %.0f", entryType, category, req.Amount))
+		logActivity(c, "catat_operasional", title, fmt.Sprintf("jenis: %s | kategori: %s | nominal: %.0f | catatan_belanja: %t | omzet_saldo: %.0f", entryType, category, req.Amount, req.IsShoppingNote, netOmzet))
 		return c.JSON(newNote)
 	})
 
