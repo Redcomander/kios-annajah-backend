@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -161,19 +162,19 @@ type ActivityLog struct {
 }
 
 type OperationalNote struct {
-	ID        uint      `gorm:"primaryKey" json:"id"`
-	EntryType string    `gorm:"index" json:"entry_type"`
-	Category  string    `gorm:"index" json:"category"`
-	IsShoppingNote bool  `gorm:"index" json:"is_shopping_note"`
-	Title     string    `json:"title"`
-	Note      string    `gorm:"type:text" json:"note"`
-	Amount    float64   `json:"amount"`
-	GrossOmzet float64  `json:"gross_omzet"`
-	NetOmzet  float64   `json:"net_omzet"`
-	EntryDate time.Time `gorm:"index" json:"entry_date"`
-	CreatedBy string    `gorm:"index" json:"created_by"`
-	CreatedAt time.Time `gorm:"index" json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID             uint      `gorm:"primaryKey" json:"id"`
+	EntryType      string    `gorm:"index" json:"entry_type"`
+	Category       string    `gorm:"index" json:"category"`
+	IsShoppingNote bool      `gorm:"index" json:"is_shopping_note"`
+	Title          string    `json:"title"`
+	Note           string    `gorm:"type:text" json:"note"`
+	Amount         float64   `json:"amount"`
+	GrossOmzet     float64   `json:"gross_omzet"`
+	NetOmzet       float64   `json:"net_omzet"`
+	EntryDate      time.Time `gorm:"index" json:"entry_date"`
+	CreatedBy      string    `gorm:"index" json:"created_by"`
+	CreatedAt      time.Time `gorm:"index" json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 var DB *gorm.DB
@@ -2268,26 +2269,33 @@ func main() {
 		period := c.Query("period", "daily")
 
 		// Use SQL GROUP BY — avoids loading all transactions into memory
-		var dateExpr string
+		var txnDateExpr string
+		var paymentDateExpr string
 		if resolveDatabaseDriver() == "sqlite" {
 			switch period {
 			case "daily":
-				dateExpr = "strftime('%Y-%m-%d', created_at)"
+				txnDateExpr = "strftime('%Y-%m-%d', created_at)"
+				paymentDateExpr = "strftime('%Y-%m-%d', credit_payments.created_at)"
 			case "monthly":
-				dateExpr = "strftime('%Y-%m', created_at)"
+				txnDateExpr = "strftime('%Y-%m', created_at)"
+				paymentDateExpr = "strftime('%Y-%m', credit_payments.created_at)"
 			case "yearly":
-				dateExpr = "strftime('%Y', created_at)"
+				txnDateExpr = "strftime('%Y', created_at)"
+				paymentDateExpr = "strftime('%Y', credit_payments.created_at)"
 			default:
 				return c.Status(400).JSON(fiber.Map{"error": "Invalid period"})
 			}
 		} else {
 			switch period {
 			case "daily":
-				dateExpr = "TO_CHAR(created_at, 'YYYY-MM-DD')"
+				txnDateExpr = "TO_CHAR(created_at, 'YYYY-MM-DD')"
+				paymentDateExpr = "TO_CHAR(credit_payments.created_at, 'YYYY-MM-DD')"
 			case "monthly":
-				dateExpr = "TO_CHAR(created_at, 'YYYY-MM')"
+				txnDateExpr = "TO_CHAR(created_at, 'YYYY-MM')"
+				paymentDateExpr = "TO_CHAR(credit_payments.created_at, 'YYYY-MM')"
 			case "yearly":
-				dateExpr = "TO_CHAR(created_at, 'YYYY')"
+				txnDateExpr = "TO_CHAR(created_at, 'YYYY')"
+				paymentDateExpr = "TO_CHAR(credit_payments.created_at, 'YYYY')"
 			default:
 				return c.Status(400).JSON(fiber.Map{"error": "Invalid period"})
 			}
@@ -2297,15 +2305,47 @@ func main() {
 			Date  string  `gorm:"column:date" json:"date"`
 			Total float64 `gorm:"column:total" json:"total"`
 		}
-		var results []chartPoint
+		var cashResults []chartPoint
 		if err := DB.Model(&Transaction{}).
-			Where("is_voided = ?", false).
-			Select(fmt.Sprintf("%s as date, SUM(total_amount) as total", dateExpr)).
-			Group(dateExpr).
-			Order(dateExpr + " asc").
-			Scan(&results).Error; err != nil {
+			Where("is_voided = ? AND payment_method <> ?", false, "kredit").
+			Select(fmt.Sprintf("%s as date, SUM(total_amount) as total", txnDateExpr)).
+			Group(txnDateExpr).
+			Order(txnDateExpr + " asc").
+			Scan(&cashResults).Error; err != nil {
 			log.Println("Report Error:", err)
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to generate report"})
+		}
+
+		var creditPaymentResults []chartPoint
+		if err := DB.Model(&CreditPayment{}).
+			Joins("JOIN credit_sales ON credit_sales.id = credit_payments.credit_sale_id").
+			Joins("JOIN transactions ON transactions.id = credit_sales.transaction_id").
+			Where("transactions.is_voided = ?", false).
+			Select(fmt.Sprintf("%s as date, SUM(credit_payments.amount) as total", paymentDateExpr)).
+			Group(paymentDateExpr).
+			Order(paymentDateExpr + " asc").
+			Scan(&creditPaymentResults).Error; err != nil {
+			log.Println("Report Error:", err)
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to generate report"})
+		}
+
+		totalsByDate := make(map[string]float64)
+		for _, row := range cashResults {
+			totalsByDate[row.Date] += row.Total
+		}
+		for _, row := range creditPaymentResults {
+			totalsByDate[row.Date] += row.Total
+		}
+
+		dates := make([]string, 0, len(totalsByDate))
+		for date := range totalsByDate {
+			dates = append(dates, date)
+		}
+		sort.Strings(dates)
+
+		results := make([]chartPoint, 0, len(dates))
+		for _, date := range dates {
+			results = append(results, chartPoint{Date: date, Total: totalsByDate[date]})
 		}
 
 		if results == nil {
@@ -2375,33 +2415,54 @@ func main() {
 
 		for _, transaction := range transactions {
 			response["transaction_count"] = response["transaction_count"].(int) + 1
-			response["total"] = response["total"].(float64) + transaction.TotalAmount
 
 			paymentMethod := strings.ToLower(strings.TrimSpace(transaction.PaymentMethod))
-			switch paymentMethod {
-			case "cash":
-				payments["cash"] = payments["cash"].(float64) + transaction.TotalAmount
-			case "transfer":
-				payments["transfer"] = payments["transfer"].(float64) + transaction.TotalAmount
-			case "qris":
-				payments["qris"] = payments["qris"].(float64) + transaction.TotalAmount
-			default:
-				payments["other"] = payments["other"].(float64) + transaction.TotalAmount
+			if paymentMethod != "kredit" {
+				response["total"] = response["total"].(float64) + transaction.TotalAmount
+				switch paymentMethod {
+				case "cash":
+					payments["cash"] = payments["cash"].(float64) + transaction.TotalAmount
+				case "transfer":
+					payments["transfer"] = payments["transfer"].(float64) + transaction.TotalAmount
+				case "qris":
+					payments["qris"] = payments["qris"].(float64) + transaction.TotalAmount
+				default:
+					payments["other"] = payments["other"].(float64) + transaction.TotalAmount
+				}
 			}
 
 			hour := transaction.CreatedAt.Hour()
 			switch {
 			case hour >= 6 && hour < 13:
-				shifts[0].TransactionCount++
-				shifts[0].Total += transaction.TotalAmount
+				if paymentMethod != "kredit" {
+					shifts[0].TransactionCount++
+					shifts[0].Total += transaction.TotalAmount
+				}
 			case hour >= 13 && hour < 18:
-				shifts[1].TransactionCount++
-				shifts[1].Total += transaction.TotalAmount
+				if paymentMethod != "kredit" {
+					shifts[1].TransactionCount++
+					shifts[1].Total += transaction.TotalAmount
+				}
 			default:
-				shifts[2].TransactionCount++
-				shifts[2].Total += transaction.TotalAmount
+				if paymentMethod != "kredit" {
+					shifts[2].TransactionCount++
+					shifts[2].Total += transaction.TotalAmount
+				}
 			}
 		}
+
+		// Credit income is recognized only when installments are paid.
+		var creditPaidToday float64
+		if err := DB.Model(&CreditPayment{}).
+			Joins("JOIN credit_sales ON credit_sales.id = credit_payments.credit_sale_id").
+			Joins("JOIN transactions ON transactions.id = credit_sales.transaction_id").
+			Where("credit_payments.created_at >= ? AND credit_payments.created_at < ? AND transactions.is_voided = ?", startOfDay, endOfDay, false).
+			Select("COALESCE(SUM(credit_payments.amount), 0)").
+			Scan(&creditPaidToday).Error; err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to load credit payments"})
+		}
+		response["total"] = response["total"].(float64) + creditPaidToday
+		payments["other"] = payments["other"].(float64) + creditPaidToday
 
 		if response["transaction_count"].(int) > 0 {
 			response["average_ticket"] = response["total"].(float64) / float64(response["transaction_count"].(int))
@@ -2558,14 +2619,14 @@ func main() {
 
 	app.Post("/api/operational-notes", Protected(), func(c *fiber.Ctx) error {
 		type Request struct {
-			EntryType string  `json:"entry_type"`
-			Category  string  `json:"category"`
-			IsShoppingNote bool `json:"is_shopping_note"`
-			Title     string  `json:"title"`
-			Note      string  `json:"note"`
-			Amount    float64 `json:"amount"`
-			GrossOmzet float64 `json:"gross_omzet"`
-			EntryDate string  `json:"entry_date"`
+			EntryType      string  `json:"entry_type"`
+			Category       string  `json:"category"`
+			IsShoppingNote bool    `json:"is_shopping_note"`
+			Title          string  `json:"title"`
+			Note           string  `json:"note"`
+			Amount         float64 `json:"amount"`
+			GrossOmzet     float64 `json:"gross_omzet"`
+			EntryDate      string  `json:"entry_date"`
 		}
 
 		req := new(Request)
@@ -2579,7 +2640,7 @@ func main() {
 		category := strings.TrimSpace(req.Category)
 		allowedCategories := map[string]bool{
 			"Operasional Warung":       true,
-			"Operasional Bensin":        true,
+			"Operasional Bensin":       true,
 			"Operasional Top Up/Pulsa": true,
 		}
 		if entryType == "" {
@@ -2625,16 +2686,16 @@ func main() {
 
 		createdBy, _ := c.Locals("username").(string)
 		newNote := OperationalNote{
-			EntryType: entryType,
-			Category:  category,
+			EntryType:      entryType,
+			Category:       category,
 			IsShoppingNote: req.IsShoppingNote,
-			Title:     title,
-			Note:      noteText,
-			Amount:    req.Amount,
-			GrossOmzet: grossOmzet,
-			NetOmzet:  netOmzet,
-			EntryDate: entryDate,
-			CreatedBy: createdBy,
+			Title:          title,
+			Note:           noteText,
+			Amount:         req.Amount,
+			GrossOmzet:     grossOmzet,
+			NetOmzet:       netOmzet,
+			EntryDate:      entryDate,
+			CreatedBy:      createdBy,
 		}
 
 		if err := DB.Create(&newNote).Error; err != nil {
